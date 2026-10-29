@@ -1,15 +1,14 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { BotMsg, ChatLayout, Composer, UserMsg, useStickToBottom } from "@/components/chat";
 import { AnimatePresence, motion } from "framer-motion";
-import { Brain, ChevronDown, CircleStop, Gauge, Loader2, Network, Play, Sparkles, Timer, Footprints } from "lucide-react";
+import { Brain, ChevronDown, Gauge, Loader2, Network, Sparkles, Timer, Footprints } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { GraphView } from "@/components/graph-view";
 import { Claims, Verdict } from "@/components/answer-card";
-import { STATUS, TOOLS, toneClass, toolMeta } from "@/components/tools";
+import { STATUS, toneClass, toolMeta } from "@/components/tools";
 import { fmtMs, fmtNum, streamHarness, type Edge, type HarnessEvent, type HarnessResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -93,9 +92,9 @@ function Meter({ icon: Icon, label, value, sub, pct, tone }: { icon: typeof Gaug
       <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
         <Icon className="h-3.5 w-3.5" /> {label}
       </div>
-      <div className="flex items-baseline gap-1.5">
-        <span className="font-mono text-lg font-semibold tabular-nums">{value}</span>
-        {sub && <span className="font-mono text-xs text-muted-foreground">{sub}</span>}
+      <div className="flex flex-wrap items-baseline gap-x-1.5">
+        <span className="whitespace-nowrap font-mono text-lg font-semibold tabular-nums">{value}</span>
+        {sub && <span className="whitespace-nowrap font-mono text-xs text-muted-foreground">{sub}</span>}
       </div>
       {pct != null && (
         <div className="h-1.5 overflow-hidden rounded-full bg-muted">
@@ -234,16 +233,122 @@ function Breakdown({ t }: { t: Record<string, number> }) {
   );
 }
 
+type Ev = HarnessEvent | { type: "reset"; query: string } | { type: "abort" };
+type Chat = { turns: State[]; sel: number };
+
+// Каждое событие стрима относится к последнему ходу; reset открывает новый ход.
+function reduceChat(c: Chat, e: Ev | { type: "select"; i: number }): Chat {
+  if (e.type === "select") return { ...c, sel: e.i };
+  if (e.type === "reset") return { turns: [...c.turns, reduce(initial, e)], sel: c.turns.length };
+  if (!c.turns.length) return c;
+  const turns = [...c.turns];
+  turns[turns.length - 1] = reduce(turns[turns.length - 1], e);
+  return { ...c, turns };
+}
+
+function view(s: State, now: number) {
+  const tools = s.steps.filter((x): x is Extract<Step, { kind: "tool" }> => x.kind === "tool");
+  const focus = tools.filter((t) => t.tool === "neighbors" && t.res?.out.startsWith("сущность:")).map((t) => t.res!.out.split("\n")[0].slice(10).trim());
+  // экономия контекста: сколько пассажей агент увидел превью vs сколько реально прочитал
+  const seen = new Set(tools.flatMap((t) => [...(t.res?.out ?? "").matchAll(/\[(P\d+)\]/g)].map((m) => m[1])));
+  const read = new Set(tools.filter((t) => t.tool === "read_passage" && t.res).flatMap((t) => ((t.args.ids as string[]) ?? []).map((h) => h.toUpperCase())));
+  return {
+    tools,
+    focus,
+    seen,
+    read,
+    stepNo: Math.max(0, ...s.steps.map((x) => x.step)),
+    elapsed: s.started ? (s.finished ?? now) - s.started : 0,
+    pct: (s.chars / s.budget) * 100,
+  };
+}
+
+function Trace({ s, last }: { s: State; last: boolean }) {
+  const [open, setOpen] = useState(true);
+  const calls = s.steps.filter((x) => x.kind === "tool").length;
+  // ход старых вопросов сворачивается, чтобы лента оставалась чатом; раскрыть можно кликом
+  useEffect(() => setOpen(last), [last]);
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger asChild>
+        <button type="button" className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground" data-testid="button-trace">
+          {s.running ? <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" /> : <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", open && "rotate-180")} />}
+          {s.running ? "агент работает" : "ход рассуждения"} · <span className="font-mono">{calls} вызовов</span>
+        </button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <div className="relative mt-3 space-y-3 before:absolute before:bottom-2 before:left-[13px] before:top-2 before:w-px before:bg-border">
+          <AnimatePresence initial={false}>
+            {s.steps.map((st, i) => (
+              <motion.div key={st.key} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}>
+                {st.kind === "thought" ? <ThoughtStep s={st} /> : <ToolStep s={st} n={i} />}
+              </motion.div>
+            ))}
+          </AnimatePresence>
+          {s.running && (
+            <div className="relative flex items-center gap-2 pl-10 text-sm text-muted-foreground">
+              <span className="absolute left-[7px] h-3 w-3 animate-pulse rounded-full bg-primary" />
+              агент думает…
+            </div>
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+function Answer({ s }: { s: State }) {
+  if (!s.result && !s.error) return null;
+  return (
+    <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
+      <Card className={cn("rounded-2xl rounded-tl-sm", s.error ? "border-destructive/50" : "border-primary/40 shadow-[0_0_40px_-16px_hsl(var(--primary)/0.5)]")} data-testid="card-answer">
+        <CardContent className="space-y-4 p-4">
+          {s.error && <p className="font-mono text-sm text-destructive">{s.error}</p>}
+          {s.result && (
+            <>
+              <Claims claims={s.result.claims} answer={s.result.answer} citations={s.result.citations} />
+              <Verdict unsupported={s.result.unsupported} />
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Badge variant="secondary" className="font-mono text-[11px]">
+                  {s.result.steps} шагов
+                </Badge>
+                <Badge variant="secondary" className="font-mono text-[11px]">
+                  {fmtNum(s.result.context_chars)} симв. контекста
+                </Badge>
+                {s.result.fix_rounds > 0 && (
+                  <Badge variant="secondary" className="font-mono text-[11px]">
+                    исправлений {s.result.fix_rounds}
+                  </Badge>
+                )}
+              </div>
+              <Breakdown t={s.result.timings_ms} />
+            </>
+          )}
+        </CardContent>
+      </Card>
+    </motion.div>
+  );
+}
+
+const FEATURES = [
+  { icon: Network, t: "Граф вместо простыни", d: "Агент ходит по связям сущностей (1–2 хопа) и читает только нужные пассажи." },
+  { icon: Gauge, t: "Бюджет контекста", d: "Каждый ответ инструмента короткий; превью вместо полных текстов экономит окно." },
+  { icon: Sparkles, t: "Проверяемый ответ", d: "Утверждения с источниками [P#]; код и верификатор отклоняют неподтверждённое." },
+];
+
 export default function HarnessPage() {
-  const [q, setQ] = useState(EXAMPLES[0]);
-  const [s, dispatch] = useReducer(reduce, initial);
+  const [c, dispatch] = useReducer(reduceChat, { turns: [], sel: 0 });
   const abort = useRef<AbortController | null>(null);
-  const bottom = useRef<HTMLDivElement>(null);
   const qc = useQueryClient();
-  const now = useNow(s.running);
+  const last = c.turns[c.turns.length - 1];
+  const running = !!last?.running;
+  const now = useNow(running);
+  const cur = c.turns[c.sel];
+  const v = useMemo(() => (cur ? view(cur, now) : undefined), [cur, now]);
+  useStickToBottom(`${c.turns.length}:${last?.steps.length}:${!!last?.result}`);
 
   const run = async (query: string) => {
-    if (!query.trim() || s.running) return;
+    if (running) return;
     abort.current = new AbortController();
     dispatch({ type: "reset", query });
     try {
@@ -257,218 +362,86 @@ export default function HarnessPage() {
     }
   };
 
-  useEffect(() => {
-    if (s.running) bottom.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [s.steps.length, s.running]);
-
-  const tools = s.steps.filter((x): x is Extract<Step, { kind: "tool" }> => x.kind === "tool");
-  const stepNo = Math.max(0, ...s.steps.map((x) => x.step));
-  const elapsed = s.started ? (s.finished ?? now) - s.started : 0;
-  const pct = (s.chars / s.budget) * 100;
-  const focus = useMemo(() => {
-    const ents = tools.filter((t) => t.tool === "neighbors" && t.res?.out.startsWith("сущность:")).map((t) => t.res!.out.split("\n")[0].slice(10).trim());
-    return ents;
-  }, [tools]);
-  // экономия контекста: сколько пассажей агент увидел превью vs сколько реально прочитал
-  const seen = new Set(tools.flatMap((t) => [...(t.res?.out ?? "").matchAll(/\[(P\d+)\]/g)].map((m) => m[1])));
-  const read = new Set(tools.filter((t) => t.tool === "read_passage" && t.res).flatMap((t) => ((t.args.ids as string[]) ?? []).map((h) => h.toUpperCase())));
-  const started = s.running || s.steps.length > 0 || s.result || s.error;
+  const aside = (
+    <>
+      <div className="grid grid-cols-3 gap-2">
+        <Meter icon={Footprints} label="Шаги" value={String(v?.stepNo ?? 0)} sub={`/ ${cur?.maxSteps ?? 8}`} pct={v ? (v.stepNo / cur!.maxSteps) * 100 : 0} tone="bg-[hsl(var(--chart-2))]" />
+        <Meter
+          icon={Gauge}
+          label="Контекст"
+          value={fmtNum(cur?.chars ?? 0)}
+          sub={`/ ${fmtNum(cur?.budget ?? 16000)}`}
+          pct={v?.pct ?? 0}
+          tone={(v?.pct ?? 0) > 75 ? "bg-[hsl(var(--chart-5))]" : (v?.pct ?? 0) > 50 ? "bg-[hsl(var(--chart-3))]" : "bg-primary"}
+        />
+        <Meter icon={Timer} label="Время" value={fmtMs(v?.elapsed ?? 0)} sub={cur?.running ? "идёт" : "итого"} />
+      </div>
+      <Card>
+        <CardHeader className="pb-2">
+          <CardTitle className="flex items-center justify-between text-base">
+            <span className="flex items-center gap-2">
+              <Network className="h-4 w-4 text-primary" /> Исследованный подграф
+            </span>
+            <span className="font-mono text-xs font-normal text-muted-foreground">{cur?.edges.length ?? 0} связей</span>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {cur ? <GraphView edges={cur.edges} focus={v!.focus} /> : <p className="py-16 text-center text-sm text-muted-foreground">Граф появится, когда агент пойдёт по связям.</p>}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardContent className="grid grid-cols-2 gap-4 p-4 text-sm">
+          <div>
+            <p className="text-xs text-muted-foreground">Пассажей увидел (превью)</p>
+            <p className="font-mono text-lg font-semibold">{v?.seen.size ?? 0}</p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground">Прочитал целиком</p>
+            <p className="font-mono text-lg font-semibold text-primary">{v?.read.size ?? 0}</p>
+          </div>
+          <p className="col-span-2 text-xs text-muted-foreground">
+            Агент читает полный текст только там, где это нужно для ответа, — остальное остаётся одной строкой превью.
+            {c.turns.length > 1 && " Кликните по своему вопросу в чате, чтобы увидеть его метрики."}
+          </p>
+        </CardContent>
+      </Card>
+    </>
+  );
 
   return (
-    <div className="space-y-6">
-      <Card className="overflow-hidden">
-        <div className="relative">
-          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top_left,hsl(var(--primary)/0.14),transparent_55%),radial-gradient(ellipse_at_bottom_right,hsl(var(--chart-2)/0.12),transparent_50%)]" />
-          <CardContent className="relative space-y-4 p-5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h1 className="text-xl font-semibold tracking-tight">Harness</h1>
-                <p className="text-sm text-muted-foreground">Агент отвечает атомарными шагами по графу знаний — каждый шаг виден вживую.</p>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                {Object.entries(TOOLS).map(([k, t]) => (
-                  <span key={k} className="flex items-center gap-1 rounded-md border bg-background/60 px-2 py-0.5 font-mono text-[11px]" style={{ color: `hsl(${t.color})` }}>
-                    <t.icon className="h-3 w-3" />
-                    {k}
-                  </span>
-                ))}
-              </div>
-            </div>
-            <form
-              className="flex flex-col gap-2 sm:flex-row"
-              onSubmit={(e) => {
-                e.preventDefault();
-                run(q);
-              }}
-            >
-              <Textarea
-                value={q}
-                onChange={(e) => setQ(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    run(q);
-                  }
-                }}
-                rows={2}
-                placeholder="Задайте вопрос по базе знаний…"
-                className="min-h-[52px] resize-none bg-background/70 text-base"
-                data-testid="input-query"
-              />
-              {s.running ? (
-                <Button type="button" variant="outline" className="h-auto min-h-[52px] gap-2 sm:w-36" onClick={() => abort.current?.abort()} data-testid="button-stop">
-                  <CircleStop className="h-4 w-4" /> Стоп
-                </Button>
-              ) : (
-                <Button type="submit" className="h-auto min-h-[52px] gap-2 sm:w-36" data-testid="button-run">
-                  <Play className="h-4 w-4" /> Запустить
-                </Button>
-              )}
-            </form>
-            <div className="flex flex-wrap gap-1.5">
-              {EXAMPLES.map((ex) => (
-                <button
-                  key={ex}
-                  type="button"
-                  disabled={s.running}
-                  onClick={() => {
-                    setQ(ex);
-                    run(ex);
-                  }}
-                  className="hover-elevate rounded-full border bg-background/60 px-3 py-1 text-xs text-muted-foreground disabled:opacity-50"
-                  data-testid="button-example"
-                >
-                  {ex}
-                </button>
-              ))}
-            </div>
-          </CardContent>
-        </div>
-      </Card>
-
-      {!started ? (
-        <div className="grid gap-4 md:grid-cols-3">
-          {[
-            { icon: Network, t: "Граф вместо простыни", d: "Агент ходит по связям сущностей (1–2 хопа) и читает только нужные пассажи." },
-            { icon: Gauge, t: "Бюджет контекста", d: "Каждый ответ инструмента короткий; превью вместо полных текстов экономит окно." },
-            { icon: Sparkles, t: "Проверяемый ответ", d: "Утверждения с источниками [P#]; код и верификатор отклоняют неподтверждённое." },
-          ].map((c) => (
-            <Card key={c.t}>
-              <CardContent className="space-y-2 p-5">
-                <c.icon className="h-5 w-5 text-primary" />
-                <p className="font-medium">{c.t}</p>
-                <p className="text-sm text-muted-foreground">{c.d}</p>
-              </CardContent>
-            </Card>
-          ))}
+    <ChatLayout
+      aside={aside}
+      composer={<Composer busy={running} onSend={run} onStop={() => abort.current?.abort()} placeholder="Задайте вопрос по базе знаний…" examples={c.turns.length ? undefined : EXAMPLES} />}
+    >
+      {!c.turns.length ? (
+        <div className="space-y-6 pt-6">
+          <div className="space-y-1">
+            <h1 className="text-2xl font-semibold tracking-tight">Harness</h1>
+            <p className="text-sm text-muted-foreground">Агент отвечает атомарными шагами по графу знаний — каждый шаг виден вживую.</p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {FEATURES.map((f) => (
+              <Card key={f.t}>
+                <CardContent className="space-y-2 p-4">
+                  <f.icon className="h-5 w-5 text-primary" />
+                  <p className="text-sm font-medium">{f.t}</p>
+                  <p className="text-xs text-muted-foreground">{f.d}</p>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
         </div>
       ) : (
-        <div className="grid gap-6 lg:grid-cols-12">
-          <section className="order-2 min-w-0 space-y-3 lg:order-1 lg:col-span-7">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-medium text-muted-foreground">Ход рассуждения</h2>
-              <span className="font-mono text-xs text-muted-foreground">{tools.length} вызовов</span>
-            </div>
-            <div className="relative space-y-3 before:absolute before:bottom-2 before:left-[13px] before:top-2 before:w-px before:bg-border">
-              <AnimatePresence initial={false}>
-                {s.steps.map((st, i) => (
-                  <motion.div key={st.key} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}>
-                    {st.kind === "thought" ? <ThoughtStep s={st} /> : <ToolStep s={st} n={i} />}
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-              {s.running && (
-                <div className="relative flex items-center gap-2 pl-10 text-sm text-muted-foreground">
-                  <span className="absolute left-[7px] h-3 w-3 animate-pulse rounded-full bg-primary" />
-                  агент думает…
-                </div>
-              )}
-              <div ref={bottom} />
-            </div>
-          </section>
-
-          <aside className="order-1 min-w-0 space-y-4 lg:sticky lg:top-20 lg:order-2 lg:col-span-5 lg:max-h-[calc(100dvh-6rem)] lg:self-start lg:overflow-y-auto lg:pr-1">
-            <div className="grid grid-cols-3 gap-2">
-              <Meter icon={Footprints} label="Шаги" value={String(stepNo)} sub={`/ ${s.maxSteps}`} pct={(stepNo / s.maxSteps) * 100} tone="bg-[hsl(var(--chart-2))]" />
-              <Meter
-                icon={Gauge}
-                label="Контекст"
-                value={fmtNum(s.chars)}
-                sub={`/ ${fmtNum(s.budget)}`}
-                pct={pct}
-                tone={pct > 75 ? "bg-[hsl(var(--chart-5))]" : pct > 50 ? "bg-[hsl(var(--chart-3))]" : "bg-primary"}
-              />
-              <Meter icon={Timer} label="Время" value={fmtMs(elapsed)} sub={s.running ? "идёт" : "итого"} />
-            </div>
-
-            <AnimatePresence>
-              {(s.result || s.error) && (
-                <motion.div initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }}>
-                  <Card className={cn(s.error ? "border-destructive/50" : "border-primary/40 shadow-[0_0_40px_-12px_hsl(var(--primary)/0.5)]")} data-testid="card-answer">
-                    <CardHeader className="pb-3">
-                      <CardTitle className="flex items-center justify-between text-base">
-                        <span>{s.error ? "Ошибка" : "Ответ"}</span>
-                        {s.result && (
-                          <span className="flex gap-1.5">
-                            <Badge variant="secondary" className="font-mono text-[11px]">
-                              {s.result.steps} шагов
-                            </Badge>
-                            {s.result.fix_rounds > 0 && (
-                              <Badge variant="secondary" className="font-mono text-[11px]">
-                                исправлений {s.result.fix_rounds}
-                              </Badge>
-                            )}
-                          </span>
-                        )}
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                      {s.error && <p className="font-mono text-sm text-destructive">{s.error}</p>}
-                      {s.result && (
-                        <>
-                          <Claims claims={s.result.claims} answer={s.result.answer} citations={s.result.citations} />
-                          <Verdict unsupported={s.result.unsupported} />
-                          <Breakdown t={s.result.timings_ms} />
-                        </>
-                      )}
-                    </CardContent>
-                  </Card>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="flex items-center justify-between text-base">
-                  <span className="flex items-center gap-2">
-                    <Network className="h-4 w-4 text-primary" /> Исследованный подграф
-                  </span>
-                  <span className="font-mono text-xs font-normal text-muted-foreground">{s.edges.length} связей</span>
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <GraphView edges={s.edges} focus={focus} />
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="grid grid-cols-2 gap-4 p-4 text-sm">
-                <div>
-                  <p className="text-xs text-muted-foreground">Пассажей увидел (превью)</p>
-                  <p className="font-mono text-lg font-semibold">{seen.size}</p>
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">Прочитал целиком</p>
-                  <p className="font-mono text-lg font-semibold text-primary">{read.size}</p>
-                </div>
-                <p className="col-span-2 text-xs text-muted-foreground">
-                  Агент читает полный текст только там, где это нужно для ответа, — остальное остаётся одной строкой превью.
-                </p>
-              </CardContent>
-            </Card>
-          </aside>
-        </div>
+        c.turns.map((t, i) => (
+          <div key={i} className="space-y-4" data-testid={`turn-${i}`}>
+            <UserMsg text={t.query} active={c.turns.length > 1 && i === c.sel} onClick={() => dispatch({ type: "select", i })} />
+            <BotMsg>
+              <Trace s={t} last={i === c.turns.length - 1} />
+              <Answer s={t} />
+            </BotMsg>
+          </div>
+        ))
       )}
-    </div>
+    </ChatLayout>
   );
 }

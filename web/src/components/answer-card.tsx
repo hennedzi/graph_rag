@@ -13,12 +13,12 @@ export function SourceBadge({ h, cite }: { h: string; cite?: Citation }) {
           </Badge>
         </button>
       </HoverCardTrigger>
-      <HoverCardContent className="w-96 max-w-[90vw]">
-        <div className="mb-2 flex items-center justify-between gap-2 font-mono text-xs text-muted-foreground">
-          <span className="text-primary">{h}</span>
-          <span className="truncate">{cite?.doc || cite?.doc_id}</span>
+      <HoverCardContent side="top" align="start" className="flex max-h-[min(22rem,var(--radix-hover-card-content-available-height))] w-[min(26rem,calc(100vw-24px))] flex-col p-0">
+        <div className="flex items-center justify-between gap-3 border-b px-3 py-2 font-mono text-xs text-muted-foreground">
+          <span className="shrink-0 text-primary">{h}</span>
+          <span className="min-w-0 truncate">{cite?.doc || cite?.doc_id}</span>
         </div>
-        <p className="max-h-64 overflow-y-auto text-sm leading-relaxed">{cite?.text || "Текст пассажа не загружен."}</p>
+        <p className="min-h-0 overflow-y-auto whitespace-pre-wrap break-words px-3 py-2.5 text-sm leading-relaxed">{cite?.text || "Текст пассажа не загружен."}</p>
       </HoverCardContent>
     </HoverCard>
   );
