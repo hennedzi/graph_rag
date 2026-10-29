@@ -1,0 +1,50 @@
+# Эмбеддинги, реранкер и Prometheus. База — Milvus Lite (graph_rag.db), LLM — Unsloth Studio, сервер — на хосте.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: [./prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  # ─────────────────────────────────────────────
+  # Эмбеддинги (BGE-M3)
+  # ─────────────────────────────────────────────
+  embeddings:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: rag-embeddings
+    ports:
+      - "8001:8080"
+    volumes:
+      # Кэш Hugging Face для сохранения скачанных моделей
+      - ./models/hf-cache:/root/.cache/huggingface
+    environment:
+      # Автоматическая загрузка модели с Hugging Face
+      LLAMA_ARG_HF_REPO: "smarttasks/bge-m3-GGUF"
+      LLAMA_ARG_HF_FILE: "bge-m3-Q8_0.gguf"
+      LLAMA_ARG_EMBEDDINGS: "1"
+      LLAMA_ARG_N_GPU_LAYERS: "99"
+      LLAMA_ARG_CTX_SIZE: "8192"
+      LLAMA_ARG_BATCH: "8192"
+      LLAMA_ARG_UBATCH: "8192"
+      LLAMA_ARG_FLASH_ATTN: "1"
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # Реранкер (BGE-Reranker-v2-M3)
+  # ─────────────────────────────────────────────
+  reranker:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: rag-reranker
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models/hf-cache:/root/.cache/huggingface
+    environment:
+      # Автоматическая загрузка модели с Hugging Face
+      LLAMA_ARG_HF_REPO: "gpustack/bge-reranker-v2-m3-GGUF"
+      LLAMA_ARG_HF_FILE: "bge-reranker-v2-m3-Q8_0.gguf"
+      LLAMA_ARG_RERANKING: "1"
+      LLAMA_ARG_CTX_SIZE: "512"
+      LLAMA_ARG_BATCH: "512"
+      LLAMA_ARG_UBATCH: "512"
+      LLAMA_ARG_FLASH_ATTN: "1"
+    restart: unless-stopped
