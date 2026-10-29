@@ -112,7 +112,7 @@ TOOLS = [
 # ─── Состояние сессии: хэндлы P# ↔ id в Milvus ─────────────────
 def new_state(query: str = "") -> dict:
     return {"query": query, "qvec": None, "pid": {}, "handle": {}, "text": {}, "read": set(), "chars": 0,
-            "trace": [], "thoughts": [], "timings": {}}
+            "trace": [], "thoughts": [], "timings": {}, "doc": {}, "edges": {}, "emit": None}
 
 
 def handle(st: dict, pid: str) -> str:
@@ -162,6 +162,14 @@ def links(st, r: dict) -> str:
     return " ".join(f"[{handle(st, p)}]" for p in r["passage_ids"][:3])
 
 
+def rel_line(st, r: dict) -> str:
+    """Строка связи для агента; заодно запоминаем ребро — из них UI рисует исследованный подграф."""
+    line = f"{r['text']} → {links(st, r)}"
+    st["edges"].setdefault(r["id"], {"src": r["src"], "dst": r["dst"], "text": r["text"],
+                                     "handles": [handle(st, p) for p in r["passage_ids"][:3]]})
+    return line
+
+
 def search_rows(vec: list[float], expr: str, limit: int, fields: list[str]) -> list[dict]:
     res = core.milvus.search(core.COLLECTION, [vec], anns_field="dense", filter=expr, limit=limit,
                              output_fields=fields, search_params={"metric_type": "IP", "params": {"ef": 64}})
@@ -187,12 +195,12 @@ async def neighbors(st, entity: str, hops: int = 1) -> str:
         rows = await rels([e], 20) if top else []
     if not rows:
         return f"у «{e}» нет связей"
-    out = f"сущность: {e}\n" + "\n".join(f"{r['text']} → {links(st, r)}" for r in rows)
+    out = f"сущность: {e}\n" + "\n".join(rel_line(st, r) for r in rows)
     if hops >= 2:  # степень 2 из Graph RAG Milvus, но через фильтр src/dst in [...] вместо матриц смежности
         seen = {r["id"] for r in rows}
         ends = sorted({x for r in rows for x in (r["src"], r["dst"])} - {e})
         far = [r for r in await rels(ends, 15 + len(seen)) if r["id"] not in seen][:15]
-        out += "\nчерез соседей:\n" + ("\n".join(f"{r['text']} → {links(st, r)}" for r in far) or "нет")
+        out += "\nчерез соседей:\n" + ("\n".join(rel_line(st, r) for r in far) or "нет")
     return out
 
 
@@ -212,14 +220,14 @@ async def query_db(st, kind: str, filter: str = "", query: str = "", count: bool
         return passage_lines(st, rows)
     if kind == "entity":
         return "\n".join(f"{r['text']} (пассажей: {len(r['passage_ids'])})" for r in rows)
-    return "\n".join(f"{r['text']} → {links(st, r)}" for r in rows)
+    return "\n".join(rel_line(st, r) for r in rows)
 
 
 def passage_lines(st, rows: list[dict]) -> str:
     """Уже прочитанные пассажи — одной меткой без превью: агент видит, что нового нет, и не ищет по кругу."""
     lines = []
     for r in rows:
-        st["text"][r["id"]] = r["text"]
+        st["text"][r["id"]], st["doc"][r["id"]] = r["text"], r["doc"]
         h = handle(st, r["id"])
         score = f" {r['score']:.2f}" if "score" in r else ""
         lines.append(f"[{h}] уже прочитан" if h in st["read"] else f"[{h}]{score} {r['doc']}: {preview(r['text'])}")
@@ -238,8 +246,8 @@ async def read_passage(st, ids: list[str]) -> str:
     hs, rest = asked[:5], asked[5:]  # 5 за вызов: агент выбирает нужные, а не читает всё подряд
     unknown = [h for h in hs if h not in st["pid"]]
     missing = [st["pid"][h] for h in hs if h in st["pid"] and st["pid"][h] not in st["text"]]
-    for r in core.get_rows(missing, ["text"]):
-        st["text"][r["id"]] = r["text"]
+    for r in core.get_rows(missing, ["text", "doc"]):
+        st["text"][r["id"]], st["doc"][r["id"]] = r["text"], r["doc"]
     out = []
     for h in hs:
         if h in unknown:
@@ -318,15 +326,23 @@ def short(text, n: int = LOG_CHARS) -> str:
     return text if len(text) <= n else text[:n] + "…"
 
 
+async def emit(st, type: str, **ev):
+    """Событие для живого UI (/harness/stream); без подписчика — no-op."""
+    if st["emit"]:
+        await st["emit"]({"type": type, **ev})
+
+
 def say(sid: str, fmt: str, *args):
     if LOG_CHARS:
         hlog.info(f"[%s] {fmt}", sid, *args)
 
 
 # ─── Цикл агента ───────────────────────────────────────────────
-async def run(query: str) -> dict:
+async def run(query: str, on_event=None) -> dict:
     st, t0, sid = new_state(query), time.perf_counter(), uuid.uuid4().hex[:6]
+    st["emit"] = on_event
     say(sid, "вопрос: %s", query)
+    await emit(st, "start", query=query, budget=BUDGET, max_steps=MAX_STEPS)
     msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": query}]
     answer, unsupported, fixes, steps, claims = None, [], 0, 0, []
 
@@ -338,6 +354,7 @@ async def run(query: str) -> dict:
         if t := thought(msg):
             st["thoughts"].append({"step": steps, "text": t})
             say(sid, "шаг %d, думает: %s", steps, short(t))
+            await emit(st, "thought", step=steps, text=t)
         if said := core.strip_think(msg.content):
             say(sid, "шаг %d, пишет: %s", steps, short(said))
         msgs.append({"role": "assistant", "content": msg.content or "",
@@ -349,19 +366,23 @@ async def run(query: str) -> dict:
         for c in calls:
             name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
             say(sid, "→ %s %s", name, short(json.dumps(args, ensure_ascii=False)))
+            await emit(st, "call", step=steps, id=c.id, tool=name, args=args)
+            t1, status, edges0 = time.perf_counter(), "ok", len(st["edges"])
             if name == "answer":
                 text, parsed, errors = render(st, args)
                 if errors:  # ловится кодом бесплатно, LLM-верификатор не зовём
                     out = "Ответ отклонён:\n" + "\n".join(f"- {e}" for e in errors) + "\nИсправь и снова вызови answer."
                     TOOL_CALLS.labels(name, "bad_answer").inc()
                     say(sid, "← answer отклонён кодом: %s", short("; ".join(errors)))
+                    await emit(st, "result", step=steps, id=c.id, tool=name, status="bad_answer", out=out,
+                               chars=len(out), ms=0, total_chars=st["chars"], edges=[])
                     st["trace"].append({"tool": name, "args": args, "chars": len(out)})
                     msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
                     continue
                 with timeit("harness_verify", st["timings"]):
                     unsupported = await check(st, text)
                 if unsupported and fixes < FIX_ROUNDS:
-                    fixes += 1
+                    fixes, status = fixes + 1, "unsupported"
                     out = ("Ответ отклонён, не подтверждены источниками:\n"
                            + "\n".join(f"- {u.get('claim')}" for u in unsupported)
                            + "\nУбери эти утверждения или прочитай источник, затем снова вызови answer.")
@@ -369,24 +390,27 @@ async def run(query: str) -> dict:
                     answer, claims = text, parsed
                     out = "принято"
             elif name not in IMPL:
-                out = f"нет инструмента {name}"
+                out, status = f"нет инструмента {name}", "unknown_tool"
             elif st["chars"] > BUDGET:
-                out = "Бюджет контекста исчерпан. Вызови answer по уже прочитанному."
+                out, status = "Бюджет контекста исчерпан. Вызови answer по уже прочитанному.", "budget"
             else:
                 try:
                     with timeit(f"tool_{name}", st["timings"]):
                         out = await IMPL[name](st, **args)
                     TOOL_CALLS.labels(name, "ok").inc()
                 except TypeError as e:  # модель передала не те аргументы — пусть исправится
-                    out = f"ошибка аргументов: {e}"
+                    out, status = f"ошибка аргументов: {e}", "bad_args"
                     TOOL_CALLS.labels(name, "bad_args").inc()
                 except (ValueError, MilvusException) as e:  # плохой фильтр: текст ошибки — подсказка агенту
-                    out = f"ошибка запроса: {getattr(e, 'message', None) or e}"[:600]
+                    out, status = f"ошибка запроса: {getattr(e, 'message', None) or e}"[:600], "bad_query"
                     TOOL_CALLS.labels(name, "bad_query").inc()
                 st["chars"] += len(out)
                 if (left := BUDGET - st["chars"]) < BUDGET // 4:  # предупреждаем заранее, а не после исчерпания
                     out += f"\n(контекст: осталось ~{max(left, 0)} из {BUDGET} симв. — пора отвечать)"
             say(sid, "← %s (%d симв.): %s", name, len(out), short(out))
+            await emit(st, "result", step=steps, id=c.id, tool=name, status=status, out=out[:3000], chars=len(out),
+                       ms=round((time.perf_counter() - t1) * 1000, 1), total_chars=st["chars"],
+                       edges=list(st["edges"].values())[edges0:])
             st["trace"].append({"tool": name, "args": args, "chars": len(out)})
             msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
             if answer is not None:
@@ -407,10 +431,11 @@ async def run(query: str) -> dict:
     CONTEXT.observe(st["chars"])
     UNSUPPORTED.inc(len(unsupported))
     st["timings"]["total"] = round((time.perf_counter() - t0) * 1000, 1)
-    cited = {h: {"doc_id": st["pid"][h], "text": preview(st["text"].get(st["pid"][h], ""))}
-             for h in st["pid"] if f"[{h}]" in answer}
+    cited = {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
+                 "text": st["text"].get(st["pid"][h], "")} for h in st["pid"] if f"[{h}]" in answer}
     result = {"query": query, "answer": answer, "claims": claims, "citations": cited, "unsupported": unsupported,
-              "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "trace": st["trace"], "thoughts": st["thoughts"]}
+              "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "trace": st["trace"], "thoughts": st["thoughts"],
+              "graph": list(st["edges"].values())}
     core.save_run(mode="harness", **result, timings_ms={k: v for k, v in st["timings"].items() if k != "total"})
     return result | {"timings_ms": st["timings"]}
 

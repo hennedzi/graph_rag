@@ -36,6 +36,8 @@
    curl -XPOST localhost:8200/harness -H 'content-type: application/json' -d '{"query":"Кто был учителем Эйлера?"}'
    ```
 7. Метрики: `localhost:8200/metrics/`; Prometheus: `localhost:9090` (поднимается тем же `docker compose up -d`).
+8. Веб-интерфейс: `localhost:8200/ui/` (корень `/` редиректит туда). Собранный `web/dist` уже лежит в проекте,
+   node нужен только чтобы менять фронтенд (см. «Веб-интерфейс»).
 
 ## ETL
 
@@ -90,6 +92,29 @@ sum by (result) (rate(etl_triples_total[1h]))                                   
 histogram_quantile(0.5, rate(harness_context_chars_bucket[1h]))                          # медиана контекста агента
 ```
 
+## Веб-интерфейс (`web/`)
+
+React + Vite + shadcn/ui + Recharts + d3-force. FastAPI отдаёт собранный `web/dist` на `/ui/`; API не меняется.
+
+- **Harness** — живой ход агента через `POST /harness/stream` (SSE): мысли, вызовы инструментов с аргументами и
+  результатами, бюджет контекста, растущий подграф связей, финальные утверждения с источниками (наведение на `P#` — текст пассажа).
+- **Поиск** — `/search` (сущности, связи, пассажи со score реранкера) рядом с `/ask`.
+- **Документы** — drag-and-drop в `/etl/documents`, статусы задач (`GET /etl/jobs`), счётчики Milvus.
+- **Метрики** — графики из `GET /dashboard` (снимок Prometheus-метрик в JSON) и `GET /runs` (история `runs/*.json`).
+
+Разработка фронтенда (API должен быть запущен на :8200, dev-сервер проксирует запросы):
+
+```
+cd web
+npm install
+npm run dev
+```
+
+Пересобрать то, что отдаёт FastAPI: `cd web && npm run build`.
+
+События `/harness/stream` (`data: {json}` на строку): `start`, `thought`, `call`, `result` (status, out, chars, ms,
+total_chars, edges), `done` (полный результат как у `/harness`), `error`.
+
 ## Что упрощено (ponytail)
 
 Из исходника убраны: обёртки `step/info/ok/warn/banner` (заменены на `logging`), неиспользуемые `min_entity_score`/`min_entities_keep`, ручной парсинг markdown-JSON (теперь один `parse_json`), auto_id (заменён хэшем, без него невозможна идемпотентная дозагрузка).
@@ -99,5 +124,7 @@ histogram_quantile(0.5, rate(harness_context_chars_bucket[1h]))                 
 - PDF/DOCX: сейчас только txt/md/json;
 - контекст соседних чанков при извлечении триплетов: местоимения на границе чанков теряются;
 - статусы задач ETL хранятся в памяти; при рестарте теряются, но повторная загрузка безопасна;
+- `/harness/stream`: если закрыть вкладку, агент доработает в фоне и сохранит run (отмены по disconnect нет);
+- `/dashboard` показывает счётчики текущего процесса: после рестарта они с нуля, история — в `runs/` и Prometheus;
 - один процесс (Milvus Lite + lock на процесс). Переход на Milvus standalone: `uri = http://localhost:19530`,
   схема и код те же, ETL можно снова вынести: `uvicorn etl:app --port 8100`.

@@ -119,3 +119,35 @@ def test_render_answer():
     assert render(st, {"claims": [], "no_answer": True})[0].startswith("В предоставленном контексте нет")
     assert render(st, {"text": "старый формат [P1]"}) == ("старый формат [P1]", [], [])
     assert render(st, {"claims": []})[2]
+
+
+def test_rel_line_records_edge():
+    from harness import new_state, rel_line
+    st = new_state()
+    r = {"id": "r1", "text": "a учил b", "src": "a", "dst": "b", "passage_ids": ["p1"]}
+    assert rel_line(st, r) == "a учил b → [P1]"
+    rel_line(st, r)  # повтор не дублирует ребро
+    assert list(st["edges"].values()) == [{"src": "a", "dst": "b", "text": "a учил b", "handles": ["P1"]}]
+
+
+def test_emit_without_listener_is_noop():
+    import asyncio
+    from harness import emit, new_state
+    st, got = new_state(), []
+    asyncio.run(emit(st, "start", query="q"))
+
+    async def put(ev):
+        got.append(ev)
+    st["emit"] = put
+    asyncio.run(emit(st, "call", tool="neighbors"))
+    assert got == [{"type": "call", "tool": "neighbors"}]
+
+
+def test_run_summary(tmp_path):
+    import json
+    from api import run_summary
+    p = tmp_path / "20260101_000000_000000.json"
+    p.write_text(json.dumps({"mode": "ask", "query": "q", "total_ms": 5, "sources": [{"score": 2.5}, {"score": 4.0}],
+                             "unsupported": [{"claim": "x"}]}), encoding="utf-8")
+    s = run_summary(p)
+    assert (s["id"], s["top_score"], s["unsupported"], s["tools"]) == (p.stem, 4.0, 1, [])

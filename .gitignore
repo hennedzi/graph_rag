@@ -8,3 +8,4 @@ volumes/
 models/
 .DS_Store
 config.ini
+web/node_modules/

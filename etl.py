@@ -234,6 +234,11 @@ async def upload(files: list[UploadFile], background: BackgroundTasks):
     return jobs
 
 
+@app.get("/jobs")
+def job_list():
+    return list(JOBS.values())[::-1]
+
+
 @app.get("/jobs/{job_id}")
 def job(job_id: str):
     if job_id not in JOBS:
