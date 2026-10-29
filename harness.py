@@ -6,6 +6,8 @@ Harness: LLM-агент поверх графа с атомарными инст
   • пассаж в контексте — это хэндл [P3] + превью; полный текст только через read_passage;
   • повторное чтение не дублирует текст («уже прочитан выше»);
   • общий бюджет символов: при превышении агенту остаётся только answer.
+Диалог: session_id продолжает сессию — история, хэндлы P# и прочитанное сохраняются,
+бюджет общий на весь диалог, поэтому уточняющий вопрос часто отвечается вообще без новых поисков.
 Почему качество выше, чем у /ask:
   • агент сам выбирает путь: сущность → связи → нужные пассажи (multi-hop);
   • ответ проверяется верификатором по прочитанным источникам, и при неподтверждённых
@@ -46,6 +48,7 @@ STEPS = Histogram("harness_steps", "Шагов LLM на вопрос", buckets=(
 CONTEXT = Histogram("harness_context_chars", "Символов отдано инструментами",
                     buckets=(1000, 2000, 4000, 6000, 8000, 12000, 16000, 20000, 32000))
 UNSUPPORTED = Counter("harness_unsupported_claims_total", "Неподтверждённые утверждения в финальном ответе")
+FOLLOWUPS = Counter("harness_followups_total", "Вопросы, продолжившие сессию")
 
 SYSTEM = f"""Ты — исследователь базы знаний (граф: сущности, отношения, пассажи). Отвечай СТРОГО по прочитанным пассажам.
 
@@ -59,9 +62,10 @@ SYSTEM = f"""Ты — исследователь базы знаний (граф
 4. read_passage — до 5 пассажей за вызов; бери те, на которые указывают нужные связи
    (связи отсортированы по близости к вопросу — верхние важнее). Не читай всё подряд.
 5. answer — как только прочитанного хватает, сразу отвечай; не ищи повторно то, что уже прочитал.
+   В уточняющем вопросе сначала проверь прочитанное выше — хэндлы [P#] из прошлых ответов действуют.
    Финал ВСЕГДА через инструмент answer: список claims, один факт в каждом, sources — хэндлы
    ПРОЧИТАННЫХ пассажей, где этот факт написан. Обычный текст без markdown.
-Бюджет контекста — {BUDGET} символов на весь вопрос; когда остаток мал, инструменты об этом скажут.
+Бюджет контекста — {BUDGET} символов на весь диалог (уточняющие вопросы тратят тот же бюджет); когда остаток мал, инструменты об этом скажут.
 
 Правила ответа:
 - только то, что явно написано в прочитанных пассажах, без цепочек выводов;
@@ -337,13 +341,70 @@ def say(sid: str, fmt: str, *args):
         hlog.info(f"[%s] {fmt}", sid, *args)
 
 
+# ─── Сессии диалога ────────────────────────────────────────────
+# shortcut: сессии в памяти процесса (теряются при рестарте, не делятся между воркерами); для нескольких
+# воркеров — хранить msgs+state в Redis/SQLite по session_id.
+SESSIONS: dict[str, dict] = {}
+SESSION_TTL, MAX_SESSIONS = 3600, 100
+
+
+class SessionError(Exception):
+    """Сессию нельзя продолжить: не найдена/истекла или по ней уже идёт вопрос."""
+
+
+def open_session(session_id: str | None, query: str) -> tuple[str, dict]:
+    now = time.monotonic()
+    for k in [k for k, v in SESSIONS.items() if now - v["used"] > SESSION_TTL and not v["busy"]]:
+        del SESSIONS[k]
+    if session_id:
+        if not (ses := SESSIONS.get(session_id)):
+            raise SessionError("сессия не найдена или истекла — начните новый диалог")
+        if ses["busy"]:
+            raise SessionError("по этой сессии уже идёт вопрос")
+        FOLLOWUPS.inc()
+    else:
+        if len(SESSIONS) >= MAX_SESSIONS:  # вытесняем самую старую свободную
+            if idle := sorted((v["used"], k) for k, v in SESSIONS.items() if not v["busy"]):
+                del SESSIONS[idle[0][1]]
+        session_id = uuid.uuid4().hex[:12]
+        SESSIONS[session_id] = ses = {"st": new_state(), "msgs": [{"role": "system", "content": SYSTEM}], "turns": 0}
+    ses.update(busy=True, used=now)
+    st = ses["st"]
+    # пер-вопросные поля сбрасываем; хэндлы, тексты, прочитанное, рёбра и бюджет — общие на диалог
+    st.update(query=query, qvec=None, trace=[], thoughts=[], timings={})
+    hint = f"\n(уже прочитаны: {' '.join(sorted(st['read'], key=lambda h: int(h[1:])))})" if st["read"] else ""
+    ses["msgs"].append({"role": "user", "content": query + hint})
+    ses["turns"] += 1
+    return session_id, ses
+
+
+def close_calls(msgs: list[dict], calls, done: set):
+    """У каждого tool_call должен быть ответ, иначе следующий ход диалога LLM-сервер может отвергнуть."""
+    for c in calls:
+        if c.id not in done:
+            msgs.append({"role": "tool", "tool_call_id": c.id, "content": "пропущено: ответ уже принят"})
+
+
 # ─── Цикл агента ───────────────────────────────────────────────
-async def run(query: str, on_event=None) -> dict:
-    st, t0, sid = new_state(query), time.perf_counter(), uuid.uuid4().hex[:6]
+async def run(query: str, on_event=None, session_id: str | None = None) -> dict:
+    session_id, ses = open_session(session_id, query)
+    try:
+        return await _run(query, on_event, session_id, ses)
+    except BaseException:  # история могла оборваться посреди tool_calls — такую сессию не продолжаем
+        SESSIONS.pop(session_id, None)
+        raise
+    finally:
+        ses["st"]["emit"] = None
+        ses.update(busy=False, used=time.monotonic())
+
+
+async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
+    st, msgs, t0, sid = ses["st"], ses["msgs"], time.perf_counter(), session_id[:6]
+    chars0 = st["chars"]
     st["emit"] = on_event
-    say(sid, "вопрос: %s", query)
-    await emit(st, "start", query=query, budget=BUDGET, max_steps=MAX_STEPS)
-    msgs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": query}]
+    say(sid, "вопрос #%d: %s", ses["turns"], query)
+    await emit(st, "start", query=query, budget=BUDGET, max_steps=MAX_STEPS, session_id=session_id,
+               turn=ses["turns"], chars=st["chars"], edges=list(st["edges"].values()))
     answer, unsupported, fixes, steps, claims = None, [], 0, 0, []
 
     while answer is None and steps < MAX_STEPS:
@@ -363,7 +424,9 @@ async def run(query: str, on_event=None) -> dict:
             answer = core.strip_think(msg.content)
             unsupported = await check(st, answer)
             break
+        done: set = set()
         for c in calls:
+            done.add(c.id)
             name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
             say(sid, "→ %s %s", name, short(json.dumps(args, ensure_ascii=False)))
             await emit(st, "call", step=steps, id=c.id, tool=name, args=args)
@@ -414,11 +477,13 @@ async def run(query: str, on_event=None) -> dict:
             st["trace"].append({"tool": name, "args": args, "chars": len(out)})
             msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
             if answer is not None:
+                close_calls(msgs, calls, done)
                 break
 
     if answer is None:  # шаги кончились — просим ответ без инструментов
         msgs.append({"role": "user", "content": "Шаги закончились. Дай финальный ответ по прочитанным пассажам со ссылками [P#]."})
         answer = core.strip_think((await core.chat(msgs)).content)
+        msgs.append({"role": "assistant", "content": answer})
         unsupported = await check(st, answer)
         OUTCOME.labels("max_steps").inc()
     else:
@@ -428,14 +493,15 @@ async def run(query: str, on_event=None) -> dict:
     say(sid, "итог за %d шагов, %d симв. контекста, неподтверждённых %d: %s",
         steps, st["chars"], len(unsupported), short(answer))
     STEPS.observe(steps)
-    CONTEXT.observe(st["chars"])
+    CONTEXT.observe(st["chars"] - chars0)
     UNSUPPORTED.inc(len(unsupported))
     st["timings"]["total"] = round((time.perf_counter() - t0) * 1000, 1)
     cited = {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
                  "text": st["text"].get(st["pid"][h], "")} for h in st["pid"] if f"[{h}]" in answer}
     result = {"query": query, "answer": answer, "claims": claims, "citations": cited, "unsupported": unsupported,
-              "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "trace": st["trace"], "thoughts": st["thoughts"],
-              "graph": list(st["edges"].values())}
+              "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "turn_chars": st["chars"] - chars0, "trace": st["trace"], "thoughts": st["thoughts"],
+              "graph": list(st["edges"].values()), "session_id": session_id, "turn": ses["turns"],
+              "budget_left": max(BUDGET - st["chars"], 0)}
     core.save_run(mode="harness", **result, timings_ms={k: v for k, v in st["timings"].items() if k != "total"})
     return result | {"timings_ms": st["timings"]}
 

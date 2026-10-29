@@ -23,6 +23,7 @@ export function Composer({
   onStop,
   placeholder,
   examples,
+  toolbar,
   testid = "input-query",
 }: {
   busy: boolean;
@@ -30,6 +31,7 @@ export function Composer({
   onStop?: () => void;
   placeholder: string;
   examples?: string[];
+  toolbar?: ReactNode;
   testid?: string;
 }) {
   const [q, setQ] = useState("");
@@ -56,6 +58,7 @@ export function Composer({
           ))}
         </div>
       )}
+      {toolbar}
       <form
         className="flex items-end gap-2 rounded-2xl border bg-card p-2 shadow-lg focus-within:border-primary/50"
         onSubmit={(e) => {

@@ -50,9 +50,13 @@ export type HarnessResult = {
   thoughts: { step: number; text: string }[];
   graph: Edge[];
   timings_ms: Timings;
+  session_id: string;
+  turn: number;
+  turn_chars: number;
+  budget_left: number;
 };
 export type HarnessEvent =
-  | { type: "start"; query: string; budget: number; max_steps: number }
+  | { type: "start"; query: string; budget: number; max_steps: number; session_id: string; turn: number; chars: number; edges: Edge[] }
   | { type: "thought"; step: number; text: string }
   | { type: "call"; step: number; id: string; tool: string; args: Record<string, unknown> }
   | {
@@ -68,7 +72,7 @@ export type HarnessEvent =
       edges: Edge[];
     }
   | { type: "done"; result: HarnessResult }
-  | { type: "error"; detail: string };
+  | { type: "error"; detail: string; session?: "lost" };
 export type Job = {
   job_id: string;
   doc: string;
@@ -102,11 +106,11 @@ export type Metric = {
 };
 
 // ─── SSE поверх POST (EventSource умеет только GET) ─────────────
-export async function streamHarness(query: string, onEvent: (e: HarnessEvent) => void, signal: AbortSignal) {
+export async function streamHarness(query: string, onEvent: (e: HarnessEvent) => void, signal: AbortSignal, sessionId?: string) {
   const res = await fetch(url("/harness/stream"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, session_id: sessionId ?? null }),
     signal,
   });
   if (!res.ok || !res.body) await ok(res);

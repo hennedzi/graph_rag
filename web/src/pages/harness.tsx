@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { BotMsg, ChatLayout, Composer, UserMsg, useStickToBottom } from "@/components/chat";
 import { AnimatePresence, motion } from "framer-motion";
-import { Brain, ChevronDown, Gauge, Loader2, Network, Sparkles, Timer, Footprints } from "lucide-react";
+import { Brain, ChevronDown, Gauge, Loader2, MessagesSquare, Network, Plus, Sparkles, Timer, Footprints } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { GraphView } from "@/components/graph-view";
 import { Claims, Verdict } from "@/components/answer-card";
@@ -42,16 +43,20 @@ type State = {
   error?: string;
   started?: number;
   finished?: number;
+  dialog: number; // номер диалога в ленте: новый диалог = новая серверная сессия
+  turn: number;
+  chars0: number; // контекст диалога до этого вопроса
 };
 
-const initial: State = { query: "", running: false, budget: 16000, maxSteps: 8, chars: 0, steps: [], edges: [] };
+const initial: State = { query: "", running: false, budget: 16000, maxSteps: 8, chars: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
 
-function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string } | { type: "abort" }): State {
+function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dialog: number } | { type: "abort" }): State {
   switch (e.type) {
     case "reset":
-      return { ...initial, query: e.query, running: true, started: Date.now() };
+      return { ...initial, query: e.query, dialog: e.dialog, running: true, started: Date.now() };
     case "start":
-      return { ...s, budget: e.budget, maxSteps: e.max_steps };
+      // в продолжении диалога сервер присылает уже накопленный контекст и подграф
+      return { ...s, budget: e.budget, maxSteps: e.max_steps, turn: e.turn, chars: e.chars, chars0: e.chars, edges: e.edges };
     case "thought":
       return { ...s, steps: [...s.steps, { kind: "thought", key: `t${s.steps.length}`, step: e.step, text: e.text }] };
     case "call":
@@ -234,16 +239,18 @@ function Breakdown({ t }: { t: Record<string, number> }) {
 }
 
 type Ev = HarnessEvent | { type: "reset"; query: string } | { type: "abort" };
-type Chat = { turns: State[]; sel: number };
+type Chat = { turns: State[]; sel: number; session?: string; dialog: number };
 
-// Каждое событие стрима относится к последнему ходу; reset открывает новый ход.
-function reduceChat(c: Chat, e: Ev | { type: "select"; i: number }): Chat {
+// Каждое событие стрима относится к последнему ходу; reset открывает новый ход в текущем диалоге.
+function reduceChat(c: Chat, e: Ev | { type: "select"; i: number } | { type: "new" }): Chat {
   if (e.type === "select") return { ...c, sel: e.i };
-  if (e.type === "reset") return { turns: [...c.turns, reduce(initial, e)], sel: c.turns.length };
+  if (e.type === "new") return { ...c, session: undefined, dialog: c.dialog + 1 };
+  if (e.type === "reset") return { ...c, turns: [...c.turns, reduce(initial, { ...e, dialog: c.dialog })], sel: c.turns.length };
   if (!c.turns.length) return c;
   const turns = [...c.turns];
   turns[turns.length - 1] = reduce(turns[turns.length - 1], e);
-  return { ...c, turns };
+  const session = e.type === "start" ? e.session_id : e.type === "error" && e.session === "lost" ? undefined : c.session;
+  return { ...c, turns, session, dialog: e.type === "error" && e.session === "lost" ? c.dialog + 1 : c.dialog };
 }
 
 function view(s: State, now: number) {
@@ -313,7 +320,7 @@ function Answer({ s }: { s: State }) {
                   {s.result.steps} шагов
                 </Badge>
                 <Badge variant="secondary" className="font-mono text-[11px]">
-                  {fmtNum(s.result.context_chars)} симв. контекста
+                  {s.turn > 1 ? `+${fmtNum(s.result.turn_chars)}` : fmtNum(s.result.context_chars)} симв. контекста
                 </Badge>
                 {s.result.fix_rounds > 0 && (
                   <Badge variant="secondary" className="font-mono text-[11px]">
@@ -330,6 +337,34 @@ function Answer({ s }: { s: State }) {
   );
 }
 
+function DialogBar({ s, onNew, busy }: { s: State; onNew: () => void; busy: boolean }) {
+  const left = Math.max(s.budget - s.chars, 0);
+  const pct = (s.chars / s.budget) * 100;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border bg-card/80 px-3 py-2 text-xs backdrop-blur" data-testid="bar-dialog">
+      <MessagesSquare className="h-3.5 w-3.5 text-primary" />
+      <span>
+        Диалог · вопрос <span className="font-mono">{s.turn}</span>
+      </span>
+      <span className="flex min-w-[120px] flex-1 items-center gap-2">
+        <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+          <span
+            className={cn("block h-full rounded-full", pct > 75 ? "bg-[hsl(var(--chart-5))]" : pct > 50 ? "bg-[hsl(var(--chart-3))]" : "bg-primary")}
+            style={{ width: `${Math.min(pct, 100)}%` }}
+          />
+        </span>
+        <span className="whitespace-nowrap font-mono text-muted-foreground">
+          осталось {fmtNum(left)} / {fmtNum(s.budget)}
+        </span>
+      </span>
+      {left === 0 && <span className="text-[hsl(var(--chart-5))]">бюджет исчерпан: ответы только по прочитанному</span>}
+      <Button size="sm" variant="outline" className="h-7 gap-1 px-2 text-xs" onClick={onNew} disabled={busy} data-testid="button-new-dialog">
+        <Plus className="h-3.5 w-3.5" /> Новый диалог
+      </Button>
+    </div>
+  );
+}
+
 const FEATURES = [
   { icon: Network, t: "Граф вместо простыни", d: "Агент ходит по связям сущностей (1–2 хопа) и читает только нужные пассажи." },
   { icon: Gauge, t: "Бюджет контекста", d: "Каждый ответ инструмента короткий; превью вместо полных текстов экономит окно." },
@@ -337,7 +372,7 @@ const FEATURES = [
 ];
 
 export default function HarnessPage() {
-  const [c, dispatch] = useReducer(reduceChat, { turns: [], sel: 0 });
+  const [c, dispatch] = useReducer(reduceChat, { turns: [], sel: 0, dialog: 0 });
   const abort = useRef<AbortController | null>(null);
   const qc = useQueryClient();
   const last = c.turns[c.turns.length - 1];
@@ -352,7 +387,7 @@ export default function HarnessPage() {
     abort.current = new AbortController();
     dispatch({ type: "reset", query });
     try {
-      await streamHarness(query, dispatch, abort.current.signal);
+      await streamHarness(query, dispatch, abort.current.signal, c.session);
     } catch (e) {
       if ((e as Error).name === "AbortError") dispatch({ type: "abort" });
       else dispatch({ type: "error", detail: (e as Error).message });
@@ -368,7 +403,7 @@ export default function HarnessPage() {
         <Meter icon={Footprints} label="Шаги" value={String(v?.stepNo ?? 0)} sub={`/ ${cur?.maxSteps ?? 8}`} pct={v ? (v.stepNo / cur!.maxSteps) * 100 : 0} tone="bg-[hsl(var(--chart-2))]" />
         <Meter
           icon={Gauge}
-          label="Контекст"
+          label={cur && cur.turn > 1 ? "Контекст диалога" : "Контекст"}
           value={fmtNum(cur?.chars ?? 0)}
           sub={`/ ${fmtNum(cur?.budget ?? 16000)}`}
           pct={v?.pct ?? 0}
@@ -411,7 +446,16 @@ export default function HarnessPage() {
   return (
     <ChatLayout
       aside={aside}
-      composer={<Composer busy={running} onSend={run} onStop={() => abort.current?.abort()} placeholder="Задайте вопрос по базе знаний…" examples={c.turns.length ? undefined : EXAMPLES} />}
+      composer={
+        <Composer
+          busy={running}
+          onSend={run}
+          onStop={() => abort.current?.abort()}
+          placeholder={c.session ? "Уточняющий вопрос — агент помнит прочитанное…" : "Задайте вопрос по базе знаний…"}
+          examples={c.turns.length ? undefined : EXAMPLES}
+          toolbar={c.session && last && <DialogBar s={last} onNew={() => dispatch({ type: "new" })} busy={running} />}
+        />
+      }
     >
       {!c.turns.length ? (
         <div className="space-y-6 pt-6">
@@ -434,6 +478,11 @@ export default function HarnessPage() {
       ) : (
         c.turns.map((t, i) => (
           <div key={i} className="space-y-4" data-testid={`turn-${i}`}>
+            {i > 0 && t.dialog !== c.turns[i - 1].dialog && (
+              <div className="flex items-center gap-3 py-2 text-xs text-muted-foreground" data-testid="divider-dialog">
+                <span className="h-px flex-1 bg-border" /> новый диалог — контекст сброшен <span className="h-px flex-1 bg-border" />
+              </div>
+            )}
             <UserMsg text={t.query} active={c.turns.length > 1 && i === c.sel} onClick={() => dispatch({ type: "select", i })} />
             <BotMsg>
               <Trace s={t} last={i === c.turns.length - 1} />

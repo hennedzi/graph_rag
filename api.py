@@ -8,6 +8,7 @@
   POST /ask      — retrieval → generation → verification (классический пайплайн)
   POST /harness  — агент с атомарными инструментами (качественнее на multi-hop, экономнее по контексту)
   POST /harness/stream — тот же агент, шаги событиями SSE (для UI)
+                   {"query": ..., "session_id": ...} — уточняющий вопрос в том же диалоге и бюджете
   GET  /runs, GET /dashboard — история запусков и снимок метрик в JSON (для UI)
   GET  /metrics  — Prometheus
   /ui/           — веб-интерфейс (собранный web/dist)
@@ -41,6 +42,10 @@ class Query(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
 
 
+class HarnessQuery(Query):
+    session_id: str | None = Field(None, max_length=64, description="продолжить диалог: id из прошлого ответа")
+
+
 @asynccontextmanager
 async def lifespan(_):
     core.ensure_collection()
@@ -59,6 +64,11 @@ async def model_down(request: Request, e: openai.APIError):
     REQUESTS.labels(request.url.path.strip("/"), "error").inc()
     core.log.error("Модель недоступна: %s", e)
     return JSONResponse({"detail": f"модель недоступна: {type(e).__name__}"}, status_code=502)
+
+
+@app.exception_handler(harness.SessionError)
+async def session_conflict(request: Request, e: harness.SessionError):
+    return JSONResponse({"detail": str(e)}, status_code=409)
 
 
 @app.exception_handler(Exception)
@@ -102,22 +112,24 @@ async def ask(q: Query):
 
 
 @app.post("/harness")
-async def ask_harness(q: Query):
-    r = await harness.run(q.query)
+async def ask_harness(q: HarnessQuery):
+    r = await harness.run(q.query, session_id=q.session_id)
     REQUESTS.labels("harness", "unsupported" if r["unsupported"] else "answered").inc()
     return r
 
 
 @app.post("/harness/stream")
-async def harness_stream(q: Query):
+async def harness_stream(q: HarnessQuery):
     """События агента (start/thought/call/result/done/error) как Server-Sent Events."""
     events: asyncio.Queue = asyncio.Queue()
 
     async def work():
         try:
-            r = await harness.run(q.query, on_event=events.put)
+            r = await harness.run(q.query, on_event=events.put, session_id=q.session_id)
             REQUESTS.labels("harness", "unsupported" if r["unsupported"] else "answered").inc()
             await events.put({"type": "done", "result": r})
+        except harness.SessionError as e:
+            await events.put({"type": "error", "detail": str(e), "session": "lost"})
         except Exception as e:  # граница фоновой задачи: ошибку отдаём в поток, а не теряем
             if isinstance(e, openai.APIError):
                 core.MODEL_ERRORS.labels("harness").inc()

@@ -151,3 +151,27 @@ def test_run_summary(tmp_path):
                              "unsupported": [{"claim": "x"}]}), encoding="utf-8")
     s = run_summary(p)
     assert (s["id"], s["top_score"], s["unsupported"], s["tools"]) == (p.stem, 4.0, 1, [])
+
+
+def test_session_keeps_dialog_state():
+    import pytest
+    from harness import SESSIONS, SessionError, close_calls, open_session
+    sid, ses = open_session(None, "Кто учитель Эйлера?")
+    ses["st"]["read"].update({"P2", "P10"})
+    ses["st"]["chars"] = 1234
+    with pytest.raises(SessionError):  # пока идёт вопрос, второй параллельно нельзя
+        open_session(sid, "ещё")
+    ses["busy"] = False
+    sid2, ses2 = open_session(sid, "А где он работал?")
+    assert sid2 == sid and ses2["turns"] == 2 and ses2["st"]["chars"] == 1234
+    assert ses2["msgs"][-1]["content"].endswith("(уже прочитаны: P2 P10)")
+    assert ses2["st"]["query"] == "А где он работал?" and ses2["st"]["trace"] == []
+    with pytest.raises(SessionError):
+        open_session("нет-такой", "q")
+
+    class C:
+        def __init__(self, i): self.id = i
+    msgs = []
+    close_calls(msgs, [C("a"), C("b")], {"a"})
+    assert [m["tool_call_id"] for m in msgs] == ["b"]
+    SESSIONS.pop(sid)
