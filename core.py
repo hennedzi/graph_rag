@@ -137,11 +137,14 @@ async def embed(texts: list[str]) -> list[list[float]]:
     return out
 
 
-async def chat(messages: list[dict], **kw):
+async def chat(messages: list[dict], usage: dict | None = None, **kw):
+    """usage — необязательный dict, куда кладём prompt/completion токены этого вызова (для бюджета harness)."""
     r = await llm.chat.completions.create(model=LLM_MODEL, messages=messages, temperature=0.0, **kw)
     if r.usage:
         LLM_TOKENS.labels("prompt").inc(r.usage.prompt_tokens)
         LLM_TOKENS.labels("completion").inc(r.usage.completion_tokens)
+        if usage is not None:
+            usage.update(prompt=r.usage.prompt_tokens, completion=r.usage.completion_tokens)
     return r.choices[0].message
 
 
@@ -212,7 +215,7 @@ def hybrid(query: str, q_dense: list[float], kind: str, limit: int, where: str =
     return [h["entity"] | {"id": h["id"], "score": h["distance"]} for h in (res[0] if res else [])]
 
 
-async def retrieve(query: str, timings: dict, top_n: int = TOP_PASSAGES):
+async def retrieve(query: str, timings: dict, top_n: int = TOP_PASSAGES, min_score: float | None = None):
     """
     Кандидаты = пассажи, связанные с найденными сущностями и отношениями (граф)
               ∪ пассажи, найденные напрямую гибридным поиском (страховка, если сущность не распознана).
@@ -232,7 +235,7 @@ async def retrieve(query: str, timings: dict, top_n: int = TOP_PASSAGES):
     with timeit("rerank", timings):
         ranked = await rerank(query, [c["text"] for c in cands], top_n)
     passages = [{"id": cands[i]["id"], "doc": cands[i]["doc"], "text": cands[i]["text"], "score": float(s)}
-                for i, s in ranked if s >= MIN_RERANK_SCORE]
+                for i, s in ranked if s >= (MIN_RERANK_SCORE if min_score is None else min_score)]
     return ents, rels, passages
 
 

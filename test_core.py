@@ -175,3 +175,21 @@ def test_session_keeps_dialog_state():
     close_calls(msgs, [C("a"), C("b")], {"a"})
     assert [m["tool_call_id"] for m in msgs] == ["b"]
     SESSIONS.pop(sid)
+
+
+def test_llm_step_counts_real_tokens(monkeypatch):
+    import asyncio
+    import harness
+    from types import SimpleNamespace as NS
+
+    async def fake_chat(msgs, usage=None, **kw):
+        usage.update(prompt=5000, completion=700)  # 700 — с рассуждениями, в окно они не попадают
+        return NS(content="ok", tool_calls=[NS(function=NS(arguments='{"q":"x"}'))])
+    monkeypatch.setattr(harness.core, "chat", fake_chat)
+    st = harness.new_state("q")
+    st["pending"] = 999
+    asyncio.run(harness.llm_step(st, [{"role": "user", "content": "q"}]))
+    assert st["ctx"] == 5000 and st["spent"] == 5700
+    assert st["pending"] == len("ok") + len('{"q":"x"}')  # старая оценка сброшена точным usage
+    st["pending"] += 3000  # ответ инструмента после вызова
+    assert harness.ctx_now(st) == 5000 + (2 + 9 + 3000) // harness.CHARS_PER_TOKEN

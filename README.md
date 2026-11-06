@@ -67,7 +67,9 @@
 
 Финальный ответ — структурированный: `answer(claims=[{text, sources:["P1"]}], no_answer)`. Код до LLM-верификатора отклоняет факт без источника и неизвестный хэндл, убирает markdown; `tool_choice = required` не даёт ответить мимо `answer` (если LLM-сервер его не умеет — один раз падаем на `auto`). В ответе `/harness` есть поле `claims`.
 
-Как экономится контекст: хэндлы `P#` вместо 34-символьных id, превью вместо текстов, полный текст только по запросу, общий бюджет `budget_chars` (16000; при остатке меньше четверти инструменты предупреждают агента). Ответ содержит `trace` (путь агента) и `context_chars`.
+Как экономится контекст: хэндлы `P#` вместо 34-символьных id, превью вместо текстов, полный текст только по запросу, общий бюджет окна `budget_tokens` (32000; автоматически урезается до `n_ctx` llama-server из `/props` минус 2048 под ответ; при остатке меньше четверти инструменты предупреждают агента). Окно считается по реальному `usage.prompt_tokens` от LLM (системный промпт, схемы инструментов, вся история) плюс оценка ~3 симв./токен для ещё не отправленных выводов. Ответ содержит `trace` (путь агента), `context_tokens` (окно сейчас), `tokens_spent` (prompt+completion за все шаги вопроса — это «счёт» за GPU), `context_chars`.
+
+`search_passages` при отсутствии совпадений выше `min_rerank_score` не отвечает «ничего», а отдаёт до 3 слабых совпадений с пометкой — порог подбирался на одном корпусе и для технических доков (README, код) может быть завышен. `find_entities` подсказывает следующий шаг `neighbors(entity)`, чтобы агент шёл по графу, а не гадал хэндлы.
 
 Диалог: ответ `/harness` содержит `session_id`; передайте его со следующим вопросом — агент продолжит ту же сессию
 (история сообщений, хэндлы `P#`, прочитанные пассажи и подграф сохраняются, бюджет общий на диалог):
@@ -76,7 +78,7 @@
 curl -XPOST localhost:8200/harness -H 'content-type: application/json' -d '{"query":"А кто пригласил его в Петербург?","session_id":"<id из прошлого ответа>"}'
 ```
 
-В ответе `turn` (номер вопроса), `turn_chars` (контекст за этот вопрос), `context_chars` (за весь диалог), `budget_left`.
+В ответе `turn` (номер вопроса), `turn_chars` (выводы инструментов за этот вопрос), `context_tokens` (окно диалога), `budget`, `budget_left` (в токенах).
 Когда бюджет кончился, инструменты отказывают и агент отвечает только по прочитанному — начните новый диалог (без `session_id`).
 Неизвестная/истёкшая сессия или параллельный вопрос в той же сессии — `409`. Метрика `harness_followups_total`.
 
@@ -93,7 +95,7 @@ curl -XPOST localhost:8200/harness -H 'content-type: application/json' -d '{"que
 | `etl_documents_total{status}`, `etl_chunks_total`, `etl_rows_written_total{type}` | объём загрузки |
 | `etl_triples_total{result}` | accepted / duplicate / rejected_format / rejected_value / rejected_json — качество экстрактора |
 | `etl_jobs_in_progress` | очередь ETL |
-| `harness_tool_calls_total{tool,status}`, `harness_steps`, `harness_context_chars`, `harness_answers_total{outcome}` | поведение агента и экономия контекста |
+| `harness_tool_calls_total{tool,status}`, `harness_steps`, `harness_context_chars`, `harness_context_tokens`, `harness_tokens_spent`, `harness_answers_total{outcome}` | поведение агента и экономия контекста |
 
 PromQL:
 ```promql

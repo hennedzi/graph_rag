@@ -53,10 +53,13 @@ export type HarnessResult = {
   session_id: string;
   turn: number;
   turn_chars: number;
+  context_tokens: number;
+  tokens_spent: number;
+  budget: number;
   budget_left: number;
 };
 export type HarnessEvent =
-  | { type: "start"; query: string; budget: number; max_steps: number; session_id: string; turn: number; chars: number; edges: Edge[] }
+  | { type: "start"; query: string; budget: number; max_steps: number; session_id: string; turn: number; chars: number; ctx_tokens: number; edges: Edge[] }
   | { type: "thought"; step: number; text: string }
   | { type: "call"; step: number; id: string; tool: string; args: Record<string, unknown> }
   | {
@@ -69,6 +72,7 @@ export type HarnessEvent =
       chars: number;
       ms: number;
       total_chars: number;
+      ctx_tokens: number;
       edges: Edge[];
     }
   | { type: "done"; result: HarnessResult }

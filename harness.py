@@ -25,6 +25,7 @@ import logging
 import re
 import sys
 import time
+import urllib.request
 import uuid
 
 import openai
@@ -35,7 +36,10 @@ import core
 from core import cfg, log, normalize, timeit
 
 MAX_STEPS = cfg.getint("harness", "max_steps")
-BUDGET = cfg.getint("harness", "budget_chars")
+# Бюджет — реальные токены окна LLM (usage.prompt_tokens от llama.cpp), а не символы ответов инструментов:
+# в окно входят системный промпт, схемы инструментов и вся история диалога. Держите ≤ n_ctx llama-server (-c).
+BUDGET = cfg.getint("harness", "budget_tokens", fallback=32000)
+CHARS_PER_TOKEN = 3  # shortcut: оценка только для текста, добавленного после последнего вызова LLM; точное число — в следующем usage
 PREVIEW = cfg.getint("harness", "preview_chars")
 FIX_ROUNDS = cfg.getint("harness", "fix_rounds")
 TOOL_CHOICE = {"choice": cfg.get("harness", "tool_choice", fallback="required")}  # required: без ответов мимо answer
@@ -47,25 +51,32 @@ OUTCOME = Counter("harness_answers_total", "Итог сессии", ["outcome"])
 STEPS = Histogram("harness_steps", "Шагов LLM на вопрос", buckets=(1, 2, 3, 4, 5, 6, 8, 10, 15))
 CONTEXT = Histogram("harness_context_chars", "Символов отдано инструментами",
                     buckets=(1000, 2000, 4000, 6000, 8000, 12000, 16000, 20000, 32000))
+CONTEXT_TOKENS = Histogram("harness_context_tokens", "Токенов в окне LLM в конце вопроса",
+                           buckets=(2000, 4000, 8000, 12000, 16000, 24000, 32000, 48000, 64000, 128000))
+SPENT_TOKENS = Histogram("harness_tokens_spent", "Токенов (prompt+completion) потрачено на вопрос",
+                         buckets=(5000, 10000, 20000, 40000, 80000, 160000, 320000))
 UNSUPPORTED = Counter("harness_unsupported_claims_total", "Неподтверждённые утверждения в финальном ответе")
 FOLLOWUPS = Counter("harness_followups_total", "Вопросы, продолжившие сессию")
 
 SYSTEM = f"""Ты — исследователь базы знаний (граф: сущности, отношения, пассажи). Отвечай СТРОГО по прочитанным пассажам.
 
 Стратегия — маленькие шаги, экономь контекст:
-1. find_entities — найди точное имя сущности из вопроса.
+1. find_entities — найди точное имя сущности из вопроса. Даже для общих вопросов (про проект, документ, термин)
+   начни с find_entities по ключевым словам: граф строится из любых документов, не только биографий.
 2. neighbors — связи сущности, отсортированы по близости к вопросу (сразу видны хэндлы [P#]).
    hops=2 — ТОЛЬКО если в вопросе есть посредник («сын учителя Эйлера», «коллега брата»);
    на прямые вопросы («что открыл Эйлер») хватает hops=1.
+   Нашлась подходящая сущность — сначала neighbors, а не чтение: хэндлы [P#] дают только neighbors/search_passages/query_db.
 3. search_passages — если связей нет или вопрос не про конкретную сущность.
    query_db — точные условия: документ, подстрока, «все отношения, где …», подсчёт (count).
 4. read_passage — до 5 пассажей за вызов; бери те, на которые указывают нужные связи
    (связи отсортированы по близости к вопросу — верхние важнее). Не читай всё подряд.
 5. answer — как только прочитанного хватает, сразу отвечай; не ищи повторно то, что уже прочитал.
-   В уточняющем вопросе сначала проверь прочитанное выше — хэндлы [P#] из прошлых ответов действуют.
+   В уточняющем вопросе сначала проверь прочитанное выше — хэндлы [P#] из прошлых ответов действуют;
+   если там нет ответа на НОВЫЙ вопрос — ищи заново, инструменты работают и в продолжении диалога.
    Финал ВСЕГДА через инструмент answer: список claims, один факт в каждом, sources — хэндлы
    ПРОЧИТАННЫХ пассажей, где этот факт написан. Обычный текст без markdown.
-Бюджет контекста — {BUDGET} символов на весь диалог (уточняющие вопросы тратят тот же бюджет); когда остаток мал, инструменты об этом скажут.
+Окно контекста общее на весь диалог (история уточняющих вопросов тоже его занимает); когда остаток мал, инструменты об этом скажут.
 
 Правила ответа:
 - только то, что явно написано в прочитанных пассажах, без цепочек выводов;
@@ -115,7 +126,7 @@ TOOLS = [
 
 # ─── Состояние сессии: хэндлы P# ↔ id в Milvus ─────────────────
 def new_state(query: str = "") -> dict:
-    return {"query": query, "qvec": None, "pid": {}, "handle": {}, "text": {}, "read": set(), "chars": 0,
+    return {"query": query, "qvec": None, "pid": {}, "handle": {}, "text": {}, "read": set(), "chars": 0, "ctx": 0, "pending": 0, "spent": 0, "budget": BUDGET,
             "trace": [], "thoughts": [], "timings": {}, "doc": {}, "edges": {}, "emit": None}
 
 
@@ -183,7 +194,10 @@ def search_rows(vec: list[float], expr: str, limit: int, fields: list[str]) -> l
 # ─── Атомарные инструменты: (state, **args) → короткая строка ──
 async def find_entities(st, query: str, k: int = 5) -> str:
     hits = await _entities(query, min(k, 10))
-    return "\n".join(f"{h['text']} (пассажей: {len(h['passage_ids'])})" for h in hits) or "ничего не найдено"
+    if not hits:
+        return "ничего не найдено"
+    return "\n".join(f"{h['text']} (пассажей: {len(h['passage_ids'])})" for h in hits) + \
+        "\n→ neighbors(entity) покажет связи подходящей сущности с хэндлами [P#]"
 
 
 async def neighbors(st, entity: str, hops: int = 1) -> str:
@@ -241,8 +255,17 @@ def passage_lines(st, rows: list[dict]) -> str:
 
 
 async def search_passages(st, query: str, k: int = 3) -> str:
-    _, _, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10))
-    return passage_lines(st, ps) if ps else "ничего выше порога релевантности"
+    """
+    Порог реранкера подобран на биографиях; на технических текстах (README, таблицы, код) честные совпадения
+    часто ниже него. Агенту лучше увидеть 3 слабых превью с пометкой, чем «ничего» и поиск по кругу.
+    """
+    _, _, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10), min_score=float("-inf"))
+    strong = [p for p in ps if p["score"] >= core.MIN_RERANK_SCORE]
+    if strong:
+        return passage_lines(st, strong)
+    if not ps:
+        return "ничего не найдено"
+    return f"выше порога {core.MIN_RERANK_SCORE} нет; слабые совпадения — проверь превью:\n" + passage_lines(st, ps[:3])
 
 
 async def read_passage(st, ids: list[str]) -> str:
@@ -255,7 +278,7 @@ async def read_passage(st, ids: list[str]) -> str:
     out = []
     for h in hs:
         if h in unknown:
-            out.append(f"[{h}] неизвестный хэндл")
+            out.append(f"[{h}] неизвестный хэндл: это не P# из выдачи; для имени сущности вызови neighbors")
         elif h in st["read"]:
             out.append(f"[{h}] уже прочитан выше")
         else:
@@ -297,16 +320,16 @@ def render(st, args: dict) -> tuple[str, list[dict], list[str]]:
     return "\n".join(f"{c['text']} " + " ".join(f"[{x}]" for x in c["sources"]) for c in claims), claims, errors
 
 
-async def chat_tools(msgs: list[dict]):
+async def chat_tools(msgs: list[dict], usage: dict | None = None):
     """tool_choice=required, а если сервер его не поддерживает — один раз падаем на auto и запоминаем."""
     try:
-        return await core.chat(msgs, tools=TOOLS, tool_choice=TOOL_CHOICE["choice"])
+        return await core.chat(msgs, usage=usage, tools=TOOLS, tool_choice=TOOL_CHOICE["choice"])
     except openai.BadRequestError as e:
         if TOOL_CHOICE["choice"] == "auto":
             raise
         log.warning("LLM-сервер не принял tool_choice=%s (%s), дальше auto", TOOL_CHOICE["choice"], e)
         TOOL_CHOICE["choice"] = "auto"
-        return await core.chat(msgs, tools=TOOLS, tool_choice="auto")
+        return await core.chat(msgs, usage=usage, tools=TOOLS, tool_choice="auto")
 
 
 async def check(st, text: str) -> list[dict]:
@@ -371,11 +394,52 @@ def open_session(session_id: str | None, query: str) -> tuple[str, dict]:
     ses.update(busy=True, used=now)
     st = ses["st"]
     # пер-вопросные поля сбрасываем; хэндлы, тексты, прочитанное, рёбра и бюджет — общие на диалог
-    st.update(query=query, qvec=None, trace=[], thoughts=[], timings={})
+    st.update(query=query, qvec=None, trace=[], thoughts=[], timings={}, spent=0)
     hint = f"\n(уже прочитаны: {' '.join(sorted(st['read'], key=lambda h: int(h[1:])))})" if st["read"] else ""
     ses["msgs"].append({"role": "user", "content": query + hint})
     ses["turns"] += 1
     return session_id, ses
+
+
+LIMIT: dict = {}
+
+
+async def budget() -> int:
+    """
+    budget_tokens, но не больше реального окна llama-server (/props → n_ctx минус запас под ответ):
+    иначе при -c меньше бюджета сервер вернёт ошибку переполнения раньше, чем агент получит предупреждение.
+    """
+    if "v" not in LIMIT:
+        LIMIT["v"] = BUDGET
+        url = str(core.llm.base_url).rstrip("/").removesuffix("/v1") + "/props"
+        try:
+            # stdlib, а не httpx: openai 3.x уже не тянет httpx, новая зависимость ради одного GET не нужна
+            props = json.loads(await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=3).read()))
+            if n := (props.get("default_generation_settings") or {}).get("n_ctx") or props.get("n_ctx"):
+                LIMIT["v"] = min(BUDGET, int(n) - 2048)
+                log.info("harness: окно llama-server n_ctx=%s, бюджет %s токенов", n, LIMIT["v"])
+        except (OSError, ValueError, AttributeError):  # не llama.cpp или нет /props — верим конфигу
+            log.info("harness: n_ctx не узнать по %s, бюджет из конфига %s токенов", url, BUDGET)
+    return LIMIT["v"]
+
+
+def ctx_now(st) -> int:
+    """Токены в окне: точные на момент последнего вызова LLM + оценка того, что добавлено после."""
+    return st["ctx"] + st["pending"] // CHARS_PER_TOKEN
+
+
+async def llm_step(st, msgs: list[dict], tools: bool = True):
+    u: dict = {}
+    msg = await (chat_tools(msgs, u) if tools else core.chat(msgs, usage=u))
+    if u:
+        st["ctx"], st["pending"] = u["prompt"], 0
+        st["spent"] += u["prompt"] + u["completion"]
+    else:  # сервер не вернул usage — оцениваем всё окно по символам
+        st["ctx"], st["pending"] = sum(len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or []))
+                                       for m in msgs) // CHARS_PER_TOKEN, 0
+    # ответ модели сам попадёт в окно (рассуждения reasoning_content — нет: в историю их не кладём)
+    st["pending"] += len(msg.content or "") + sum(len(c.function.arguments or "") for c in msg.tool_calls or [])
+    return msg
 
 
 def close_calls(msgs: list[dict], calls, done: set):
@@ -400,17 +464,18 @@ async def run(query: str, on_event=None, session_id: str | None = None) -> dict:
 
 async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     st, msgs, t0, sid = ses["st"], ses["msgs"], time.perf_counter(), session_id[:6]
-    chars0 = st["chars"]
+    chars0, st["pending"] = st["chars"], st["pending"] + len(msgs[-1]["content"])
+    st["budget"] = B = await budget()
     st["emit"] = on_event
     say(sid, "вопрос #%d: %s", ses["turns"], query)
-    await emit(st, "start", query=query, budget=BUDGET, max_steps=MAX_STEPS, session_id=session_id,
-               turn=ses["turns"], chars=st["chars"], edges=list(st["edges"].values()))
+    await emit(st, "start", query=query, budget=B, max_steps=MAX_STEPS, session_id=session_id,
+               turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()))
     answer, unsupported, fixes, steps, claims = None, [], 0, 0, []
 
     while answer is None and steps < MAX_STEPS:
         steps += 1
         with timeit("harness_llm", st["timings"]):
-            msg = await chat_tools(msgs)
+            msg = await llm_step(st, msgs)
         calls = msg.tool_calls or []
         if t := thought(msg):
             st["thoughts"].append({"step": steps, "text": t})
@@ -438,9 +503,10 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                     TOOL_CALLS.labels(name, "bad_answer").inc()
                     say(sid, "← answer отклонён кодом: %s", short("; ".join(errors)))
                     await emit(st, "result", step=steps, id=c.id, tool=name, status="bad_answer", out=out,
-                               chars=len(out), ms=0, total_chars=st["chars"], edges=[])
+                               chars=len(out), ms=0, total_chars=st["chars"], ctx_tokens=ctx_now(st), edges=[])
                     st["trace"].append({"tool": name, "args": args, "chars": len(out)})
                     msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
+                    st["pending"] += len(out)
                     continue
                 with timeit("harness_verify", st["timings"]):
                     unsupported = await check(st, text)
@@ -454,8 +520,8 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                     out = "принято"
             elif name not in IMPL:
                 out, status = f"нет инструмента {name}", "unknown_tool"
-            elif st["chars"] > BUDGET:
-                out, status = "Бюджет контекста исчерпан. Вызови answer по уже прочитанному.", "budget"
+            elif ctx_now(st) > B:
+                out, status = "Бюджет окна исчерпан. Вызови answer по уже прочитанному.", "budget"
             else:
                 try:
                     with timeit(f"tool_{name}", st["timings"]):
@@ -468,21 +534,23 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                     out, status = f"ошибка запроса: {getattr(e, 'message', None) or e}"[:600], "bad_query"
                     TOOL_CALLS.labels(name, "bad_query").inc()
                 st["chars"] += len(out)
-                if (left := BUDGET - st["chars"]) < BUDGET // 4:  # предупреждаем заранее, а не после исчерпания
-                    out += f"\n(контекст: осталось ~{max(left, 0)} из {BUDGET} симв. — пора отвечать)"
+                if (left := B - ctx_now(st) - len(out) // CHARS_PER_TOKEN) < B // 4:  # заранее, а не после
+                    out += f"\n(окно: осталось ~{max(left, 0)} из {B} токенов — пора отвечать)"
             say(sid, "← %s (%d симв.): %s", name, len(out), short(out))
             await emit(st, "result", step=steps, id=c.id, tool=name, status=status, out=out[:3000], chars=len(out),
                        ms=round((time.perf_counter() - t1) * 1000, 1), total_chars=st["chars"],
+                       ctx_tokens=ctx_now(st) + len(out) // CHARS_PER_TOKEN,
                        edges=list(st["edges"].values())[edges0:])
             st["trace"].append({"tool": name, "args": args, "chars": len(out)})
             msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
+            st["pending"] += len(out)
             if answer is not None:
                 close_calls(msgs, calls, done)
                 break
 
     if answer is None:  # шаги кончились — просим ответ без инструментов
         msgs.append({"role": "user", "content": "Шаги закончились. Дай финальный ответ по прочитанным пассажам со ссылками [P#]."})
-        answer = core.strip_think((await core.chat(msgs)).content)
+        answer = core.strip_think((await llm_step(st, msgs, tools=False)).content)
         msgs.append({"role": "assistant", "content": answer})
         unsupported = await check(st, answer)
         OUTCOME.labels("max_steps").inc()
@@ -490,10 +558,12 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
         OUTCOME.labels("no_context" if answer.startswith(core.NO_CONTEXT[:30])
                        else "unsupported" if unsupported else "answered").inc()
 
-    say(sid, "итог за %d шагов, %d симв. контекста, неподтверждённых %d: %s",
-        steps, st["chars"], len(unsupported), short(answer))
+    say(sid, "итог за %d шагов, окно %d/%d токенов, потрачено %d токенов, неподтверждённых %d: %s",
+        steps, ctx_now(st), B, st["spent"], len(unsupported), short(answer))
     STEPS.observe(steps)
     CONTEXT.observe(st["chars"] - chars0)
+    CONTEXT_TOKENS.observe(ctx_now(st))
+    SPENT_TOKENS.observe(st["spent"])
     UNSUPPORTED.inc(len(unsupported))
     st["timings"]["total"] = round((time.perf_counter() - t0) * 1000, 1)
     cited = {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
@@ -501,7 +571,8 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     result = {"query": query, "answer": answer, "claims": claims, "citations": cited, "unsupported": unsupported,
               "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "turn_chars": st["chars"] - chars0, "trace": st["trace"], "thoughts": st["thoughts"],
               "graph": list(st["edges"].values()), "session_id": session_id, "turn": ses["turns"],
-              "budget_left": max(BUDGET - st["chars"], 0)}
+              "context_tokens": ctx_now(st), "tokens_spent": st["spent"], "budget": B,
+              "budget_left": max(B - ctx_now(st), 0)}
     core.save_run(mode="harness", **result, timings_ms={k: v for k, v in st["timings"].items() if k != "total"})
     return result | {"timings_ms": st["timings"]}
 

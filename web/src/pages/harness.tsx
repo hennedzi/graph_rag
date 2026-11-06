@@ -37,6 +37,7 @@ type State = {
   budget: number;
   maxSteps: number;
   chars: number;
+  ctx: number; // токены окна LLM (usage.prompt_tokens + оценка новых выводов)
   steps: Step[];
   edges: Edge[];
   result?: HarnessResult;
@@ -48,7 +49,7 @@ type State = {
   chars0: number; // контекст диалога до этого вопроса
 };
 
-const initial: State = { query: "", running: false, budget: 16000, maxSteps: 8, chars: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
+const initial: State = { query: "", running: false, budget: 32000, maxSteps: 8, chars: 0, ctx: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
 
 function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dialog: number } | { type: "abort" }): State {
   switch (e.type) {
@@ -56,7 +57,7 @@ function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dial
       return { ...initial, query: e.query, dialog: e.dialog, running: true, started: Date.now() };
     case "start":
       // в продолжении диалога сервер присылает уже накопленный контекст и подграф
-      return { ...s, budget: e.budget, maxSteps: e.max_steps, turn: e.turn, chars: e.chars, chars0: e.chars, edges: e.edges };
+      return { ...s, budget: e.budget, maxSteps: e.max_steps, turn: e.turn, chars: e.chars, ctx: e.ctx_tokens, chars0: e.chars, edges: e.edges };
     case "thought":
       return { ...s, steps: [...s.steps, { kind: "thought", key: `t${s.steps.length}`, step: e.step, text: e.text }] };
     case "call":
@@ -70,10 +71,10 @@ function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dial
           break;
         }
       }
-      return { ...s, steps, chars: e.total_chars, edges: e.edges.length ? [...s.edges, ...e.edges] : s.edges };
+      return { ...s, steps, chars: e.total_chars, ctx: e.ctx_tokens, edges: e.edges.length ? [...s.edges, ...e.edges] : s.edges };
     }
     case "done":
-      return { ...s, running: false, result: e.result, chars: e.result.context_chars, finished: Date.now() };
+      return { ...s, running: false, result: e.result, chars: e.result.context_chars, ctx: e.result.context_tokens, budget: e.result.budget, finished: Date.now() };
     case "error":
       return { ...s, running: false, error: e.detail, finished: Date.now() };
     case "abort":
@@ -266,7 +267,7 @@ function view(s: State, now: number) {
     read,
     stepNo: Math.max(0, ...s.steps.map((x) => x.step)),
     elapsed: s.started ? (s.finished ?? now) - s.started : 0,
-    pct: (s.chars / s.budget) * 100,
+    pct: (s.ctx / s.budget) * 100,
   };
 }
 
@@ -320,7 +321,10 @@ function Answer({ s }: { s: State }) {
                   {s.result.steps} шагов
                 </Badge>
                 <Badge variant="secondary" className="font-mono text-[11px]">
-                  {s.turn > 1 ? `+${fmtNum(s.result.turn_chars)}` : fmtNum(s.result.context_chars)} симв. контекста
+                  {fmtNum(s.result.context_tokens)} ток. в окне
+                </Badge>
+                <Badge variant="secondary" className="font-mono text-[11px]">
+                  потрачено {fmtNum(s.result.tokens_spent)} ток.
                 </Badge>
                 {s.result.fix_rounds > 0 && (
                   <Badge variant="secondary" className="font-mono text-[11px]">
@@ -338,8 +342,8 @@ function Answer({ s }: { s: State }) {
 }
 
 function DialogBar({ s, onNew, busy }: { s: State; onNew: () => void; busy: boolean }) {
-  const left = Math.max(s.budget - s.chars, 0);
-  const pct = (s.chars / s.budget) * 100;
+  const left = Math.max(s.budget - s.ctx, 0);
+  const pct = (s.ctx / s.budget) * 100;
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border bg-card/80 px-3 py-2 text-xs backdrop-blur" data-testid="bar-dialog">
       <MessagesSquare className="h-3.5 w-3.5 text-primary" />
@@ -354,7 +358,7 @@ function DialogBar({ s, onNew, busy }: { s: State; onNew: () => void; busy: bool
           />
         </span>
         <span className="whitespace-nowrap font-mono text-muted-foreground">
-          осталось {fmtNum(left)} / {fmtNum(s.budget)}
+          осталось {fmtNum(left)} / {fmtNum(s.budget)} ток.
         </span>
       </span>
       {left === 0 && <span className="text-[hsl(var(--chart-5))]">бюджет исчерпан: ответы только по прочитанному</span>}
@@ -404,8 +408,8 @@ export default function HarnessPage() {
         <Meter
           icon={Gauge}
           label={cur && cur.turn > 1 ? "Контекст диалога" : "Контекст"}
-          value={fmtNum(cur?.chars ?? 0)}
-          sub={`/ ${fmtNum(cur?.budget ?? 16000)}`}
+          value={fmtNum(cur?.ctx ?? 0)}
+          sub={`/ ${fmtNum(cur?.budget ?? 32000)} ток.`}
           pct={v?.pct ?? 0}
           tone={(v?.pct ?? 0) > 75 ? "bg-[hsl(var(--chart-5))]" : (v?.pct ?? 0) > 50 ? "bg-[hsl(var(--chart-3))]" : "bg-primary"}
         />
