@@ -13,13 +13,35 @@ export function predicate(e: Edge) {
   return t;
 }
 
-export function GraphView({ edges, focus, height = 380 }: { edges: Edge[]; focus?: string[]; height?: number }) {
+/**
+ * height не задан — граф заполняет родителя по высоте (панель инспектора). weights — размер вершины (PPR),
+ * highlight — подсвеченные рёбра "src|dst" (путь), onNode — клик по вершине.
+ */
+export function GraphView({
+  edges,
+  focus,
+  height,
+  weights,
+  highlight,
+  onNode,
+}: {
+  edges: Edge[];
+  focus?: string[];
+  height?: number;
+  weights?: Record<string, number>;
+  highlight?: Set<string>;
+  onNode?: (id: string) => void;
+}) {
   const box = useRef<HTMLDivElement>(null);
   const [W, setW] = useState(480);
-  const H = height;
+  const [mh, setMh] = useState(380);
+  const H = height ?? mh;
   useEffect(() => {
     // viewBox = реальный размер в px: шрифт и радиусы не мельчают при росте графа
-    const ro = new ResizeObserver(([e]) => setW(Math.max(260, Math.round(e.contentRect.width))));
+    const ro = new ResizeObserver(([e]) => {
+      setW(Math.max(260, Math.round(e.contentRect.width)));
+      setMh(Math.max(240, Math.round(e.contentRect.height)));
+    });
     if (box.current) ro.observe(box.current);
     return () => ro.disconnect();
   }, []);
@@ -77,21 +99,24 @@ export function GraphView({ edges, focus, height = 380 }: { edges: Edge[]; focus
   const list = [...nodes.current.values()];
   if (!list.length)
     return (
-      <div ref={box} className="flex items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground" style={{ height }}>
+      <div ref={box} className={cn("flex items-center justify-center rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground", !height && "h-full")} style={{ height }}>
         Граф появится, когда агент начнёт ходить по связям
       </div>
     );
   const focusSet = new Set(focus ?? []);
   const maxDeg = Math.max(...list.map((n) => n.degree));
+  const maxW = weights ? Math.max(1e-9, ...Object.values(weights)) : 0;
+  const radius = (n: Node) => (weights ? 5 + Math.sqrt((weights[n.id] ?? 0) / maxW) * 13 : 6 + (n.degree / maxDeg) * 8);
+  const lit = (l: Link) => highlight?.has(`${l.source.id}|${l.target.id}`) || highlight?.has(`${l.target.id}|${l.source.id}`);
   const near = (id: string) => hover === id || links.some((l) => (l.source.id === hover && l.target.id === id) || (l.target.id === hover && l.source.id === id));
   const fresh = (born: number) => Date.now() - born < 2500;
 
   return (
-    <div ref={box}>
+    <div ref={box} className={cn(!height && "h-full")}>
     <svg
       viewBox={`0 0 ${W} ${H}`}
-      className="w-full select-none rounded-lg bg-[radial-gradient(circle_at_center,hsl(var(--primary)/0.07),transparent_70%)]"
-      style={{ height }}
+      className="block w-full select-none rounded-lg bg-[radial-gradient(circle_at_center,hsl(var(--primary)/0.07),transparent_70%)]"
+      style={{ height: H }}
       data-testid="graph-view"
     >
       <defs>
@@ -109,12 +134,12 @@ export function GraphView({ edges, focus, height = 380 }: { edges: Edge[]; focus
               x2={l.target.x}
               y2={l.target.y}
               markerEnd="url(#arrow)"
-              strokeWidth={on ? 2 : 1.2}
-              className={fresh(l.born) ? "stroke-primary" : "stroke-muted-foreground/40"}
+              strokeWidth={on || lit(l) ? 2.4 : 1.2}
+              className={lit(l) ? "stroke-[hsl(var(--chart-3))]" : fresh(l.born) ? "stroke-primary" : "stroke-muted-foreground/40"}
             >
               <title>{l.text}</title>
             </line>
-            {(on || links.length <= 10) && (
+            {(on || lit(l) || links.length <= 10) && (
               <text
                 x={((l.source.x ?? 0) + (l.target.x ?? 0)) / 2}
                 y={((l.source.y ?? 0) + (l.target.y ?? 0)) / 2 - 4}
@@ -129,7 +154,7 @@ export function GraphView({ edges, focus, height = 380 }: { edges: Edge[]; focus
         );
       })}
       {list.map((n) => {
-        const r = 6 + (n.degree / maxDeg) * 8;
+        const r = radius(n);
         const isFocus = focusSet.has(n.id);
         return (
           <g
@@ -137,8 +162,9 @@ export function GraphView({ edges, focus, height = 380 }: { edges: Edge[]; focus
             transform={`translate(${n.x},${n.y})`}
             onMouseEnter={() => setHover(n.id)}
             onMouseLeave={() => setHover(null)}
+            onClick={() => onNode?.(n.id)}
             opacity={hover && !near(n.id) ? 0.25 : 1}
-            className="cursor-default"
+            className={onNode ? "cursor-pointer" : "cursor-default"}
           >
             {fresh(n.born) && <circle r={r + 6} className="animate-ping fill-primary/30" style={{ transformBox: "fill-box", transformOrigin: "center" }} />}
             <circle
@@ -150,8 +176,8 @@ export function GraphView({ edges, focus, height = 380 }: { edges: Edge[]; focus
         );
       })}
       {list.map((n) => {
-        const r = 6 + (n.degree / maxDeg) * 8;
-        const show = !hover ? focusSet.has(n.id) || n.degree > 1 || list.length <= 14 : near(n.id);
+        const r = radius(n);
+        const show = !hover ? focusSet.has(n.id) || n.degree > 1 || list.length <= 14 || (weights?.[n.id] ?? 0) > maxW * 0.25 : near(n.id);
         if (!show) return null;
         return (
           <text

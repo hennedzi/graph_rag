@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { FileText, GitBranch, Tag, Timer } from "lucide-react";
+import { FileText, GitBranch, Loader2, Search as SearchIcon, Tag, Timer } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { BotMsg, ChatLayout, Composer, UserMsg, useStickToBottom } from "@/components/chat";
+import { BotMsg, ChatPane, Composer, UserMsg, useStickToBottom } from "@/components/chat";
+import { ListItem, SectionLabel, Workspace } from "@/components/shell";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SourceBadge, Verdict } from "@/components/answer-card";
@@ -123,7 +124,7 @@ function AskAnswer({ t }: { t: Turn }) {
       </div>
     );
   return (
-    <Card className="rounded-2xl rounded-tl-sm" data-testid="card-ask">
+    <Card className="border-primary/30" data-testid="card-ask">
       <CardContent className="space-y-4 p-4">
         <p className="whitespace-pre-wrap text-sm leading-relaxed">{t.ask.answer}</p>
         <div className="flex flex-wrap gap-1">
@@ -144,7 +145,7 @@ export default function SearchPage() {
   const patch = (i: number, p: Partial<Turn>) => setTurns((ts) => ts.map((t, j) => (j === i ? { ...t, ...p } : t)));
   const last = turns[turns.length - 1];
   const busy = !!last && ((!last.search && !last.sErr) || (!last.ask && !last.aErr));
-  useStickToBottom(`${turns.length}:${!!last?.ask}`);
+  const scroll = useStickToBottom(`${turns.length}:${!!last?.ask}`);
 
   const go = (q: string) => {
     const i = turns.length;
@@ -155,34 +156,61 @@ export default function SearchPage() {
   };
   const cur = turns[sel];
 
+  const select = (i: number) => {
+    setSel(i);
+    document.getElementById(`sturn-${i}`)?.scrollIntoView({ block: "start", behavior: "smooth" });
+  };
+
   return (
-    <ChatLayout
-      composer={<Composer busy={busy} onSend={go} placeholder="Вопрос для /search + /ask…" examples={turns.length ? undefined : EXAMPLES} testid="input-search" />}
-      aside={
-        cur ? (
-          <Retrieval r={cur.search} err={cur.sErr} />
-        ) : (
-          <Card>
-            <CardContent className="p-8 text-center text-sm text-muted-foreground">Здесь появятся сущности, связи, пассажи и тайминги retrieval.</CardContent>
-          </Card>
-        )
+    <Workspace
+      id="search"
+      title="Поиск и классический ответ"
+      sidebarTitle="Запросы"
+      sidebar={
+        <div className="pb-3">
+          <SectionLabel>Эта вкладка</SectionLabel>
+          {!turns.length && <p className="px-3 py-2 text-xs text-muted-foreground">Запросы появятся здесь.</p>}
+          {turns.map((t, i) => (
+            <ListItem
+              key={i}
+              active={i === sel}
+              onClick={() => select(i)}
+              icon={!t.ask && !t.aErr ? <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" /> : <SearchIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+              title={t.q}
+              meta={t.search ? `${t.search.passages.length} пассажей · ${fmtMs(Object.values(t.search.timings_ms).reduce((a, b) => a + b, 0))}` : "…"}
+            />
+          ))}
+        </div>
+      }
+      inspector={
+        <div className="flex h-full flex-col">
+          <div className="flex h-9 shrink-0 items-center border-b px-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Retrieval</div>
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-3">
+            {cur ? <Retrieval r={cur.search} err={cur.sErr} /> : <p className="p-6 text-center text-sm text-muted-foreground">Здесь появятся сущности, связи, пассажи и тайминги retrieval.</p>}
+          </div>
+        </div>
       }
     >
-      {!turns.length ? (
-        <div className="space-y-1 pt-6">
-          <h1 className="text-2xl font-semibold tracking-tight">Поиск и классический ответ</h1>
-          <p className="text-sm text-muted-foreground">/search — гибридный retrieval (dense + BM25 → RRF → реранк), /ask — один проход генерации с верификацией.</p>
-        </div>
-      ) : (
-        turns.map((t, i) => (
-          <div key={i} className="space-y-4" data-testid={`turn-${i}`}>
-            <UserMsg text={t.q} active={turns.length > 1 && i === sel} onClick={() => setSel(i)} />
-            <BotMsg>
-              <AskAnswer t={t} />
-            </BotMsg>
+      <ChatPane
+        scrollRef={scroll}
+        composer={<Composer busy={busy} onSend={go} placeholder="Вопрос для /search + /ask…" examples={turns.length ? undefined : EXAMPLES} testid="input-search" />}
+      >
+        {!turns.length ? (
+          <div className="space-y-1 pt-8">
+            <h1 className="text-xl font-semibold tracking-tight">Поиск и классический ответ</h1>
+            <p className="text-sm text-muted-foreground">/search — гибридный retrieval (dense + BM25 → RRF → реранк), /ask — один проход генерации с верификацией.</p>
           </div>
-        ))
-      )}
-    </ChatLayout>
+        ) : (
+          turns.map((t, i) => (
+            <div key={i} id={`sturn-${i}`} className="scroll-mt-4 space-y-3" data-testid={`turn-${i}`}>
+              <UserMsg text={t.q} active={turns.length > 1 && i === sel} onClick={() => select(i)} />
+              <BotMsg>
+                <AskAnswer t={t} />
+              </BotMsg>
+            </div>
+          ))
+        )}
+      </ChatPane>
+    </Workspace>
   );
 }

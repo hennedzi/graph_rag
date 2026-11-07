@@ -33,6 +33,7 @@ from prometheus_client import Counter, Histogram
 from pymilvus.exceptions import MilvusException
 
 import core
+import graph
 from core import cfg, log, normalize, timeit
 
 MAX_STEPS = cfg.getint("harness", "max_steps")
@@ -57,6 +58,7 @@ SPENT_TOKENS = Histogram("harness_tokens_spent", "Токенов (prompt+complet
                          buckets=(5000, 10000, 20000, 40000, 80000, 160000, 320000))
 UNSUPPORTED = Counter("harness_unsupported_claims_total", "Неподтверждённые утверждения в финальном ответе")
 FOLLOWUPS = Counter("harness_followups_total", "Вопросы, продолжившие сессию")
+OFF_TOPIC = Counter("harness_offtopic_claims_total", "Верные, но не по вопросу утверждения, выброшенные из ответа")
 
 SYSTEM = f"""Ты — исследователь базы знаний (граф: сущности, отношения, пассажи). Отвечай СТРОГО по прочитанным пассажам.
 
@@ -67,21 +69,32 @@ SYSTEM = f"""Ты — исследователь базы знаний (граф
    hops=2 — ТОЛЬКО если в вопросе есть посредник («сын учителя Эйлера», «коллега брата»);
    на прямые вопросы («что открыл Эйлер») хватает hops=1.
    Нашлась подходящая сущность — сначала neighbors, а не чтение: хэндлы [P#] дают только neighbors/search_passages/query_db.
-3. search_passages — если связей нет или вопрос не про конкретную сущность.
+   rank_by_ppr — Personalized PageRank от сущностей вопроса по ВСЕМУ графу: самые связанные с ними сущности
+   и пассажи. Для широких и многоходовых вопросов («какой вклад», «кто повлиял», «что объединяет») — вместо hops=2.
+   find_paths — цепочки связей между ДВУМЯ сущностями (до 3 хопов) с хэндлами [P#]: «как связаны X и Y»,
+   «через кого X связан с Y». Цепочка — подсказка, какие пассажи читать; факты всё равно бери из пассажей.
+   В вопросе уже подсказаны возможные сущности графа — если они по теме, find_entities не нужен.
+3. search_passages — если связей нет или вопрос не про конкретную сущность; он тоже показывает найденные
+   сущности и связи графа — по ним можно продолжить neighbors.
    query_db — точные условия: документ, подстрока, «все отношения, где …», подсчёт (count).
 4. read_passage — до 5 пассажей за вызов; бери те, на которые указывают нужные связи
    (связи отсортированы по близости к вопросу — верхние важнее). Не читай всё подряд.
 5. answer — как только прочитанного хватает, сразу отвечай; не ищи повторно то, что уже прочитал.
    В уточняющем вопросе сначала проверь прочитанное выше — хэндлы [P#] из прошлых ответов действуют;
    если там нет ответа на НОВЫЙ вопрос — ищи заново, инструменты работают и в продолжении диалога.
+   Если к реплике приписано «(вопрос целиком: …)» — отвечай на этот вопрос, а не на буквальные слова реплики.
    Финал ВСЕГДА через инструмент answer: список claims, один факт в каждом, sources — хэндлы
    ПРОЧИТАННЫХ пассажей, где этот факт написан. Обычный текст без markdown.
+Реплика без вопроса к базе (благодарность, приветствие, «понятно», мнение, просьба без предмета) —
+сразу answer(reply="короткий ответ без фактов"), без поиска. На вопрос о фактах reply не принимается.
 Окно контекста общее на весь диалог (история уточняющих вопросов тоже его занимает); когда остаток мал, инструменты об этом скажут.
 
 Правила ответа:
 - только то, что явно написано в прочитанных пассажах, без цепочек выводов;
 - не объединяй факты о разных людях; отвечай только про того, о ком спросили, и только на вопрос;
-- если ответа нет — answer с no_answer=true."""
+- каждое утверждение должно отвечать именно на вопрос; верные, но посторонние факты, найденные попутно
+  (интерфейс, порты, команды — когда спрашивали не про них), не включай: проверка их отбросит;
+- если в прочитанном нет ответа на САМ вопрос — answer с no_answer=true, даже если нашлось что-то по соседней теме."""
 
 
 def _fn(name, desc, props, required):
@@ -110,17 +123,25 @@ TOOLS = [
     _fn("find_entities", "Найти сущности по имени/описанию. Возвращает нормализованные имена.", {"query": _str, "k": _int}, ["query"]),
     _fn("neighbors", "Связи сущности 'субъект предикат объект → [P#]', ближайшие к вопросу сверху. hops=2 — плюс связи соседей.",
         {"entity": _str, "hops": {"type": "integer", "minimum": 1, "maximum": 2}}, ["entity"]),
+    _fn("rank_by_ppr", "Personalized PageRank от seed-сущностей: топ связанных сущностей и пассажей по всему графу, "
+                       "плюс связи seed с топом. Для многоходовых и обзорных вопросов.",
+        {"entities": {"type": "array", "items": _str, "minItems": 1, "maxItems": 5}, "k": _int}, ["entities"]),
+    _fn("find_paths", "Цепочки связей source → … → target (до max_hops хопов) с хэндлами [P#], короткие и через "
+                      "узкие вершины сверху. Для «как связаны X и Y».",
+        {"source": _str, "target": _str, "max_hops": {"type": "integer", "minimum": 1, "maximum": 4}}, ["source", "target"]),
     _fn("query_db", QUERY_DB, {"kind": _kind, "filter": _str, "query": _str, "count": {"type": "boolean"},
                                "k": {"type": "integer", "minimum": 1, "maximum": 20}}, ["kind"]),
     _fn("search_passages", "Гибридный поиск пассажей с реранкером. Возвращает [P#], score и превью.", {"query": _str, "k": _int}, ["query"]),
     _fn("read_passage", "Полный текст пассажей по хэндлам, не больше 5 за вызов.", {"ids": {"type": "array", "items": _str}}, ["ids"]),
     _fn("answer", "Финальный ответ: атомарные утверждения, у каждого — хэндлы прочитанных пассажей. "
-                  "Если в пассажах ответа нет — no_answer=true и пустой claims.",
+                  "Если в пассажах ответа нет — no_answer=true и пустой claims. Реплика не про факты — reply.",
         {"claims": {"type": "array", "items": {"type": "object", "properties": {
             "text": {"type": "string", "description": "один факт, обычный текст без markdown"},
             "sources": {"type": "array", "items": _str, "minItems": 1, "description": "хэндлы, например [\"P1\"]"}},
             "required": ["text", "sources"]}},
-         "no_answer": {"type": "boolean"}}, ["claims"]),
+         "no_answer": {"type": "boolean"},
+         "reply": {"type": "string", "description": "ответ на реплику без вопроса к базе (спасибо, привет); без фактов"}},
+        []),
 ]
 
 
@@ -177,11 +198,16 @@ def links(st, r: dict) -> str:
     return " ".join(f"[{handle(st, p)}]" for p in r["passage_ids"][:3])
 
 
-def rel_line(st, r: dict) -> str:
-    """Строка связи для агента; заодно запоминаем ребро — из них UI рисует исследованный подграф."""
-    line = f"{r['text']} → {links(st, r)}"
+def remember(st, r: dict):
+    """Ребро в исследованный подграф — из них UI рисует граф."""
     st["edges"].setdefault(r["id"], {"src": r["src"], "dst": r["dst"], "text": r["text"],
                                      "handles": [handle(st, p) for p in r["passage_ids"][:3]]})
+
+
+def rel_line(st, r: dict) -> str:
+    """Строка связи для агента; заодно запоминаем ребро."""
+    line = f"{r['text']} → {links(st, r)}"
+    remember(st, r)
     return line
 
 
@@ -197,7 +223,7 @@ async def find_entities(st, query: str, k: int = 5) -> str:
     if not hits:
         return "ничего не найдено"
     return "\n".join(f"{h['text']} (пассажей: {len(h['passage_ids'])})" for h in hits) + \
-        "\n→ neighbors(entity) покажет связи подходящей сущности с хэндлами [P#]"
+        "\n→ neighbors(entity) — связи сущности с хэндлами [P#]; rank_by_ppr([..]) — шире по графу; find_paths(a, b) — как связаны две"
 
 
 async def neighbors(st, entity: str, hops: int = 1) -> str:
@@ -205,8 +231,9 @@ async def neighbors(st, entity: str, hops: int = 1) -> str:
         lit = json.dumps(ents, ensure_ascii=False)
         return search_rows(await qvec(st), f'type == "relation" and (src in {lit} or dst in {lit})', limit,
                            ["text", "src", "dst", "passage_ids"])
-    e = normalize(entity)
-    rows = await rels([e], 20)
+    e, g = normalize(entity), graph.get()
+    e = g["alias"].get(e, e)
+    rows = await rels(g["group"].get(e, [e]), 20)  # все написания сущности: «эйлер» и «леонард эйлер»
     if not rows:  # агент передал «Эйлер» вместо «леонард эйлер» — берём ближайшую сущность
         top = await _entities(entity, 1)
         e = top[0]["text"] if top else e
@@ -254,18 +281,38 @@ def passage_lines(st, rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def graph_part(st, ents: list[dict], rels: list[dict]) -> str:
+    """
+    retrieve и так берёт кандидатов через граф (passage_ids найденных сущностей и связей), но раньше это
+    выбрасывалось: агент видел «обычный поиск» и не шёл по связям, а UI — пустой граф. Теперь видно обоим.
+    """
+    lines = [rel_line(st, r) for r in rels[:3]]
+    names = " · ".join(e["text"] for e in ents[:3])
+    return (f"граф: сущности {names} — для их связей neighbors/find_paths\n" if names else "") + "".join(f"{x}\n" for x in lines)
+
+
 async def search_passages(st, query: str, k: int = 3) -> str:
     """
     Порог реранкера подобран на биографиях; на технических текстах (README, таблицы, код) честные совпадения
     часто ниже него. Агенту лучше увидеть 3 слабых превью с пометкой, чем «ничего» и поиск по кругу.
     """
-    _, _, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10), min_score=float("-inf"))
+    ents, rels, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10), min_score=float("-inf"))
+    head = graph_part(st, ents, rels)
     strong = [p for p in ps if p["score"] >= core.MIN_RERANK_SCORE]
     if strong:
-        return passage_lines(st, strong)
+        return head + passage_lines(st, strong)
     if not ps:
-        return "ничего не найдено"
-    return f"выше порога {core.MIN_RERANK_SCORE} нет; слабые совпадения — проверь превью:\n" + passage_lines(st, ps[:3])
+        return head + "пассажей не найдено"
+    return head + f"выше порога {core.MIN_RERANK_SCORE} нет; слабые совпадения — проверь превью:\n" + passage_lines(st, ps[:3])
+
+
+async def seed_hint(st) -> str:
+    """
+    Кандидаты-сущности вопроса кладутся прямо в вопрос: маленькая модель на «как работает X» сама выбирает
+    search_passages, а с готовыми именами сразу идёт neighbors/find_paths — и экономит шаг find_entities.
+    """
+    hits = core.hybrid(st["query"], await qvec(st), "entity", 3)
+    return " · ".join(f"{h['text']} ({len(h['passage_ids'])} пасс.)" for h in hits)
 
 
 async def read_passage(st, ids: list[str]) -> str:
@@ -289,7 +336,60 @@ async def read_passage(st, ids: list[str]) -> str:
     return "\n\n".join(out)
 
 
-IMPL = {"find_entities": find_entities, "neighbors": neighbors, "query_db": query_db,
+async def _seeds(names: list[str]) -> tuple[dict, list[str]]:
+    g = graph.get()
+    found = [await graph.resolve_any(g, n) for n in names[:5]]
+    return g, list(dict.fromkeys(e for e in found if e))
+
+
+async def rank_by_ppr(st, entities: list[str], k: int = 8) -> str:
+    g, seeds = await _seeds([entities] if isinstance(entities, str) else entities)
+    if not seeds:
+        return "ни одной из сущностей нет в графе — сначала find_entities"
+    k = max(1, min(int(k), 10))
+    r = graph.ppr(g["adj"], dict.fromkeys(seeds, 1.0))
+    top = sorted((e for e in r if e not in seeds), key=r.get, reverse=True)[:k]
+    if not top:
+        return f"seed: {', '.join(seeds)}\nу seed нет связей в графе"
+    ps = sorted(graph.passage_scores(r, g["ent_passages"]).items(), key=lambda x: -x[1])[:5]
+    texts = {p["id"]: p for p in core.get_rows([p for p, _ in ps], ["text", "doc"])}
+    rows = [texts[p] | {"score": s * 100} for p, s in ps if p in texts]
+    near = [graph.relation_between(g, s, e) for e in top for s in seeds if frozenset((s, e)) in g["rels"]]
+    out = (f"seed: {', '.join(seeds)}\nсущности по PPR (% массы): "
+           + " · ".join(f"{e} {r[e] * 100:.1f}" for e in top)
+           + "\nпассажи по массе сущностей (%):\n" + passage_lines(st, rows))
+    for e in top:  # связи внутри топа тоже в подграф UI: видно, как вершины связаны между собой
+        for x in top + seeds:
+            if x != e and frozenset((x, e)) in g["rels"]:
+                remember(st, graph.relation_between(g, x, e))
+    return out + ("\nсвязи seed с топом:\n" + "\n".join(rel_line(st, x) for x in near[:8]) if near else "")
+
+
+def path_line(st, g: dict, path: list[str]) -> str:
+    out, hs = path[0], []
+    for a, b in zip(path, path[1:]):
+        r = graph.relation_between(g, a, b)
+        p = graph.predicate(r)
+        fwd = g["alias"].get(r["src"], r["src"]) == a
+        out += f" —{p}→ {b}" if fwd else f" ←{p}— {b}"
+        remember(st, r)
+        hs += [handle(st, x) for x in r["passage_ids"][:2]]
+    return out + "  " + " ".join(f"[{h}]" for h in dict.fromkeys(hs))
+
+
+async def find_paths(st, source: str, target: str, max_hops: int = 3) -> str:
+    g, ends = await _seeds([source, target])
+    if len(ends) < 2:
+        return "одна из сущностей не найдена в графе (или это одна и та же сущность) — уточни через find_entities"
+    hops = max(1, min(int(max_hops), 4))
+    found = graph.paths(g["adj"], ends[0], ends[1], hops)
+    if not found:
+        return f"путей «{ends[0]}» → «{ends[1]}» до {hops} хопов нет; попробуй rank_by_ppr или search_passages"
+    return f"пути {ends[0]} → {ends[1]}:\n" + "\n".join(path_line(st, g, p) for p in found)
+
+
+IMPL = {"find_entities": find_entities, "neighbors": neighbors, "rank_by_ppr": rank_by_ppr, "find_paths": find_paths,
+        "query_db": query_db,
         "search_passages": search_passages, "read_passage": read_passage}
 
 
@@ -300,6 +400,13 @@ def render(st, args: dict) -> tuple[str, list[dict], list[str]]:
     """
     if args.get("no_answer"):
         return core.NO_CONTEXT, [], []
+    if (reply := str(args.get("reply") or "").strip()) and not args.get("claims"):
+        # reply не верифицируется, поэтому пускаем его только на не-вопрос и без ссылок/длинных фактов
+        if is_question(st["query"]):
+            return reply, [], ["это вопрос к базе: reply нельзя — найди пассажи и дай claims или no_answer=true"]
+        if "[P" in reply or len(reply) > 300:
+            return reply, [], ["reply — короткая реплика без фактов и ссылок; факты — только через claims"]
+        return reply, [], []
     if not isinstance(args.get("claims"), list):
         text = str(args.get("text", "")).strip()
         return text, [], [] if text else ["пустой ответ: передай claims"]
@@ -317,7 +424,22 @@ def render(st, args: dict) -> tuple[str, list[dict], list[str]]:
         claims.append({"text": fact, "sources": srcs})
     if not claims and not errors:
         errors.append("пустой claims: дай утверждения или no_answer=true")
-    return "\n".join(f"{c['text']} " + " ".join(f"[{x}]" for x in c["sources"]) for c in claims), claims, errors
+    return fmt(claims), claims, errors
+
+
+def lines_to_claims(st, text: str) -> list[dict]:
+    """Ответ текстом → claims: строка без известного хэндла [P#] — не факт из источника, отбрасываем."""
+    out = []
+    for line in text.splitlines():
+        srcs = [h for h in dict.fromkeys(re.findall(r"\[(P\d+)\]", line)) if h in st["pid"]]
+        fact = re.sub(r"\s*\[P\d+\]", "", re.sub(r"[*`]+", "", line)).strip().lstrip("-•#0123456789.) ").strip()
+        if srcs and fact:
+            out.append({"text": fact, "sources": srcs})
+    return out
+
+
+def fmt(claims: list[dict]) -> str:
+    return "\n".join(f"{c['text']} " + " ".join(f"[{x}]" for x in c["sources"]) for c in claims)
 
 
 async def chat_tools(msgs: list[dict], usage: dict | None = None):
@@ -337,6 +459,73 @@ async def check(st, text: str) -> list[dict]:
     cited = [h for h in st["pid"] if f"[{h}]" in text]
     await read_passage(st, [h for h in cited if h not in st["read"]])
     return await core.verify(text, {h: st["text"].get(st["pid"][h], "") for h in cited})
+
+
+RELEVANT_PROMPT = """Вопрос: {q}
+
+Утверждения ответа:
+{claims}
+
+Для каждого утверждения реши: относится ли оно к вопросу — отвечает на него, его часть или поясняет ответ.
+off_topic=true ТОЛЬКО если утверждение про другую тему: например, на «как работает поиск» — раскладка
+интерфейса, порт сервера, поля событий. Сомневаешься — off_topic=false.
+Верни СТРОГО JSON-массив: [{{"n": номер, "off_topic": true|false}}]
+Только JSON, без пояснений и markdown.
+
+JSON:"""
+
+
+async def off_topic(st, claims: list[dict]) -> list[dict]:
+    """Верификатор проверяет только «написано ли в источнике», поэтому верный, но посторонний факт проходил как ответ."""
+    if not claims:
+        return []
+    listing = "\n".join(f"{i}. {c['text']}" for i, c in enumerate(claims, 1))
+    raw = await core.ask_llm(RELEVANT_PROMPT.format(q=st["query"], claims=listing))
+    checks = core.parse_json(raw, None)
+    if not isinstance(checks, list):  # сломанный JSON не должен выбрасывать ответ
+        log.warning("Проверка релевантности вернула невалидный JSON: %s", short(raw))
+        return []
+    # выбрасываем только явное off_topic=true: ошибка судьи не должна стирать верный ответ
+    drop = {int(c["n"]) for c in checks if isinstance(c, dict) and c.get("off_topic") is True and str(c.get("n")).isdigit()}
+    if drop:
+        say(st.get("sid", ""), "не по вопросу «%s»: %s", st["query"], short(raw))
+    return [c for i, c in enumerate(claims, 1) if i in drop]
+
+
+RESOLVE_PROMPT = """Перепиши реплику пользователя в самостоятельный вопрос к базе знаний.
+
+Прошлые вопросы пользователя (последний внизу):
+{questions}
+
+Последний ответ ассистента:
+{answer}
+
+Новая реплика: «{q}»
+
+Правила:
+- реплика ссылается на прошлое («это», «он», «а где», «что это значит») — подставь, о чём речь;
+- реплика — возражение или жалоба на ответ («это неправда», «это не ответ на мой вопрос», «не то») —
+  верни дословно тот прошлый вопрос, на который ответ не устроил;
+- реплика уточняет предмет («я про X», «имею в виду X») — перепиши ПОСЛЕДНИЙ вопрос с этим предметом
+  (например, «что ещё умеет приложение?» + «я про Graph RAG» → «что ещё умеет приложение Graph RAG?»);
+- реплика без вопроса (спасибо, оценка, «теперь лучше», согласие) — верни её дословно;
+- реплика уже самостоятельный вопрос — верни её без изменений.
+Верни только вопрос одной строкой, без пояснений."""
+
+
+async def resolve(ses: dict, query: str) -> str:
+    """
+    «И что это значит», «ЭТО НЕ ПРАВДА» раньше уходили в поиск дословно: сущности и ранжирование связей
+    шли по словам «запоминаются», «error», и агент цитировал случайные пассажи. Ищем по полному вопросу.
+    """
+    if not (past := ses.get("questions")):
+        return query
+    u: dict = {}
+    prompt = RESOLVE_PROMPT.format(questions="\n".join(past[-5:]), answer=ses.get("prev", ""), q=query)
+    out = core.strip_think((await core.chat([{"role": "user", "content": prompt}], usage=u)).content)
+    ses["st"]["spent"] += u.get("prompt", 0) + u.get("completion", 0)
+    line = next((x.strip(" «»\"'") for x in out.splitlines() if x.strip()), "")
+    return line if 0 < len(line) <= 500 else query
 
 
 # ─── Ход мыслей в лог ──────────────────────────────────────────
@@ -449,10 +638,90 @@ def close_calls(msgs: list[dict], calls, done: set):
             msgs.append({"role": "tool", "tool_call_id": c.id, "content": "пропущено: ответ уже принят"})
 
 
+# ─── Реплики без поиска ────────────────────────────────────────
+# «Спасибо» и «опиши проще» не должны запускать поиск: первое отвечается без LLM, второе — одним вызовом
+# по прошлому ответу (с проверкой ссылок верификатором), а не 5–10 шагами агента.
+CHAT_WORDS = {
+    "thanks": {"спасибо", "спс", "благодарю", "мерси", "thanks", "thank", "thx"},
+    "hello": {"привет", "здравствуй", "здравствуйте", "добрый", "день", "вечер", "утро", "hi", "hello", "хай"},
+    "bye": {"пока", "до", "свидания", "встречи", "bye"},
+    "ok": {"ок", "окей", "ok", "okay", "понятно", "ясно", "понял", "поняла", "хорошо", "отлично", "супер", "класс",
+           "круто", "здорово", "ага", "угу", "да", "нет", "good", "great", "cool", "большое", "огромное", "тебе", "вам",
+           "все", "ну", "и", "а", "еще", "раз", "очень", "так", "теперь", "лучше", "намного", "гораздо"},
+}
+CHAT_REPLY = {
+    "thanks": "Пожалуйста. Задайте следующий вопрос или попросите пересказать ответ проще или короче.",
+    "hello": "Здравствуйте. Спросите что-нибудь по базе знаний — отвечу со ссылками на источники.",
+    "bye": "До встречи.",
+    "ok": "Хорошо. Можно задать следующий вопрос или попросить ответ «проще» или «короче».",
+}
+REWRITE = re.compile(r"\b(?:попроще|проще|покороче|короче|кратко|кратче|вкратце|в двух словах|своими словами|понятнее|"
+                     r"перефразир\w*|переформулир\w*|упрост\w*|списком|по пунктам|одним предложением|"
+                     r"по-английски|на английском)\b")
+FILLER = {"опиши", "объясни", "расскажи", "скажи", "сделай", "напиши", "перескажи", "изложи", "сформулируй", "ответь",
+          "можно", "можешь", "попробуй", "давай", "пожалуйста", "а", "ну", "и", "это", "то", "же", "так", "ли", "еще",
+          "ответ", "мне", "чуть", "немного", "его", "как", "нибудь", "по", "сказать", "надо", "нужно", "лучше", "ты"}
+QWORDS = {"кто", "что", "где", "когда", "почему", "зачем", "как", "какой", "какая", "какое", "какие", "каков", "сколько",
+          "чей", "чем", "откуда", "куда", "ли", "who", "what", "where", "when", "why", "how", "which"}
+
+
+def words(text: str) -> list[str]:
+    return re.findall(r"[a-zа-я][a-zа-я-]*", text.lower().replace("ё", "е"))
+
+
+def is_question(text: str) -> bool:
+    return "?" in text or bool(set(words(text)) & QWORDS)
+
+
+def route(query: str, has_answer: bool) -> str:
+    """chat — реплика без вопроса (ответ шаблоном); rewrite — переформулировать прошлый ответ; agent — искать."""
+    w = words(query)
+    if len(w) <= 6 and all(x in CHAT_WORDS["thanks"] | CHAT_WORDS["hello"] | CHAT_WORDS["bye"] | CHAT_WORDS["ok"] for x in w):
+        return "chat"
+    joined = " ".join(w)
+    if has_answer and REWRITE.search(joined) and not set(REWRITE.sub(" ", joined).split()) - FILLER:
+        return "rewrite"
+    return "agent"
+
+
+def chat_reply(query: str) -> str:
+    w = set(words(query))
+    return next((CHAT_REPLY[k] for k in ("thanks", "hello", "bye") if w & CHAT_WORDS[k] - {"до", "день", "вечер", "утро"}),
+                CHAT_REPLY["ok"] if w else "Задайте вопрос по базе знаний.")
+
+
+REWRITE_PROMPT = """Пользователь просит переформулировать твой прошлый ответ: «{q}».
+Правила: только факты из прошлого ответа, ничего не добавляй и не додумывай; после каждого факта оставь
+его ссылки [P#] ровно как в оригинале; обычный текст без markdown.
+
+Прошлый ответ:
+{a}
+
+Новый ответ:"""
+
+
+async def quick(query: str, kind: str, st: dict, ses: dict) -> tuple[str, list[dict], str]:
+    """Ответ без цикла агента. Возвращает (ответ, неподтверждённые, итог для метрики)."""
+    if kind == "chat":
+        return chat_reply(query), [], "chat"
+    last, u = ses["last"], {}
+    with timeit("harness_rewrite", st["timings"]):
+        text = core.strip_think((await core.chat([{"role": "user", "content": REWRITE_PROMPT.format(q=query, a=last)}],
+                                                 usage=u)).content)
+    st["spent"] += u.get("prompt", 0) + u.get("completion", 0)
+    with timeit("harness_verify", st["timings"]):
+        bad = await check(st, text) if re.search(r"\[P\d+\]", text) else [{"claim": "в пересказе пропали ссылки [P#]"}]
+    if bad:  # пересказ что-то добавил или потерял источники — честнее отдать прошлый проверенный ответ
+        return f"Проще пересказать без потери точности не вышло, прошлый ответ:\n{last}", [], "rewrite_fallback"
+    return text, [], "rewrite"
+
+
 # ─── Цикл агента ───────────────────────────────────────────────
 async def run(query: str, on_event=None, session_id: str | None = None) -> dict:
     session_id, ses = open_session(session_id, query)
     try:
+        if (kind := route(query, bool(ses.get("last")))) != "agent":
+            return await _quick(query, kind, on_event, session_id, ses)
         return await _run(query, on_event, session_id, ses)
     except BaseException:  # история могла оборваться посреди tool_calls — такую сессию не продолжаем
         SESSIONS.pop(session_id, None)
@@ -464,12 +733,27 @@ async def run(query: str, on_event=None, session_id: str | None = None) -> dict:
 
 async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     st, msgs, t0, sid = ses["st"], ses["msgs"], time.perf_counter(), session_id[:6]
+    st["sid"] = sid
+    with timeit("harness_resolve", st["timings"]):
+        st["query"] = await resolve(ses, query)
+    if normalize(st["query"]) != normalize(query):
+        retry = st["query"] in ses.get("questions", [])
+        msgs[-1]["content"] += f"\n(вопрос целиком: {st['query']}" + (
+            "; прошлый ответ пользователя не устроил — найди ответ именно на этот вопрос, "
+            "а если его нет в документах — no_answer=true)" if retry else ")")
+    with timeit("harness_seed", st["timings"]):
+        seeds = await seed_hint(st)
+    if seeds:
+        msgs[-1]["content"] += f"\n(возможные сущности вопроса в графе: {seeds} — если подходят, начни с neighbors, find_paths или rank_by_ppr)"
     chars0, st["pending"] = st["chars"], st["pending"] + len(msgs[-1]["content"])
     st["budget"] = B = await budget()
     st["emit"] = on_event
     say(sid, "вопрос #%d: %s", ses["turns"], query)
     await emit(st, "start", query=query, budget=B, max_steps=MAX_STEPS, session_id=session_id,
                turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()))
+    if seeds:
+        st["thoughts"].append({"step": 0, "text": f"Сущности вопроса в графе: {seeds}"})
+        await emit(st, "thought", step=0, text=f"Сущности вопроса в графе: {seeds}")
     answer, unsupported, fixes, steps, claims = None, [], 0, 0, []
 
     while answer is None and steps < MAX_STEPS:
@@ -509,13 +793,21 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                     st["pending"] += len(out)
                     continue
                 with timeit("harness_verify", st["timings"]):
-                    unsupported = await check(st, text)
-                if unsupported and fixes < FIX_ROUNDS:
-                    fixes, status = fixes + 1, "unsupported"
-                    out = ("Ответ отклонён, не подтверждены источниками:\n"
-                           + "\n".join(f"- {u.get('claim')}" for u in unsupported)
-                           + "\nУбери эти утверждения или прочитай источник, затем снова вызови answer.")
+                    unsupported, off = await asyncio.gather(check(st, text), off_topic(st, parsed))
+                if (unsupported or off) and fixes < FIX_ROUNDS:
+                    fixes, status = fixes + 1, "unsupported" if unsupported else "off_topic"
+                    out = ("Ответ отклонён:\n"
+                           + "".join(f"- не подтверждено источниками: {u.get('claim')}\n" for u in unsupported)
+                           + "".join(f"- не отвечает на вопрос «{st['query']}»: {c['text']}\n" for c in off)
+                           + "Убери эти утверждения. Если без них ответа на вопрос нет — найди именно его "
+                             "или вызови answer(no_answer=true).")
                 else:
+                    if off:  # последний шанс исправиться прошёл — посторонние факты выбрасываем сами
+                        OFF_TOPIC.inc(len(off))
+                        parsed = [c for c in parsed if c not in off]
+                        text = fmt(parsed) or (f"{core.NO_CONTEXT} На вопрос «{st['query']}» в документах ответа "
+                                               "не нашлось — только факты не по теме.")
+                        unsupported = unsupported if parsed else []
                     answer, claims = text, parsed
                     out = "принято"
             elif name not in IMPL:
@@ -548,11 +840,19 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                 close_calls(msgs, calls, done)
                 break
 
-    if answer is None:  # шаги кончились — просим ответ без инструментов
-        msgs.append({"role": "user", "content": "Шаги закончились. Дай финальный ответ по прочитанным пассажам со ссылками [P#]."})
-        answer = core.strip_think((await llm_step(st, msgs, tools=False)).content)
-        msgs.append({"role": "assistant", "content": answer})
-        unsupported = await check(st, answer)
+    if answer is None:  # шаги кончились — просим ответ без инструментов, но проверяем так же, как answer
+        msgs.append({"role": "user", "content": f"Шаги закончились. Ответь на вопрос «{st['query']}» по прочитанным "
+                     "пассажам: один факт в строке, в конце строки ссылки [P#], без markdown. "
+                     f"Если ответа на этот вопрос в прочитанном нет — ответь: {core.NO_CONTEXT}"})
+        raw = core.strip_think((await llm_step(st, msgs, tools=False)).content)
+        msgs.append({"role": "assistant", "content": raw})
+        claims = lines_to_claims(st, raw)
+        with timeit("harness_verify", st["timings"]):
+            unsupported, off = await asyncio.gather(check(st, fmt(claims)), off_topic(st, claims))
+        OFF_TOPIC.inc(len(off))
+        claims = [c for c in claims if c not in off]
+        answer = fmt(claims) or core.NO_CONTEXT
+        unsupported = unsupported if claims else []
         OUTCOME.labels("max_steps").inc()
     else:
         OUTCOME.labels("no_context" if answer.startswith(core.NO_CONTEXT[:30])
@@ -560,19 +860,42 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
 
     say(sid, "итог за %d шагов, окно %d/%d токенов, потрачено %d токенов, неподтверждённых %d: %s",
         steps, ctx_now(st), B, st["spent"], len(unsupported), short(answer))
+    ses["prev"] = answer
+    if st["query"] not in (qs := ses.setdefault("questions", [])):
+        qs.append(st["query"])
+    if claims and not unsupported:
+        ses["last"] = answer  # для «опиши проще»: пересказывать можно только проверенный ответ со ссылками
     STEPS.observe(steps)
     CONTEXT.observe(st["chars"] - chars0)
     CONTEXT_TOKENS.observe(ctx_now(st))
     SPENT_TOKENS.observe(st["spent"])
     UNSUPPORTED.inc(len(unsupported))
+    return finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, "agent")
+
+
+async def _quick(query: str, kind: str, on_event, session_id: str, ses: dict) -> dict:
+    st, t0, chars0 = ses["st"], time.perf_counter(), ses["st"]["chars"]
+    st["budget"], st["emit"] = await budget(), on_event
+    await emit(st, "start", query=query, budget=st["budget"], max_steps=0, session_id=session_id, route=kind,
+               turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()))
+    answer, unsupported, kind = await quick(query, kind, st, ses)
+    ses["msgs"].append({"role": "assistant", "content": answer})  # агент увидит реплику в следующем вопросе
+    st["pending"] += len(ses["msgs"][-2]["content"]) + len(answer)
+    OUTCOME.labels(kind).inc()
+    say(session_id[:6], "без поиска (%s): %s", kind, short(answer))
+    return finish(st, ses, session_id, query, answer, [], unsupported, 0, 0, chars0, t0, kind)
+
+
+def finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, kind) -> dict:
+    B = st["budget"]
     st["timings"]["total"] = round((time.perf_counter() - t0) * 1000, 1)
     cited = {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
                  "text": st["text"].get(st["pid"][h], "")} for h in st["pid"] if f"[{h}]" in answer}
-    result = {"query": query, "answer": answer, "claims": claims, "citations": cited, "unsupported": unsupported,
+    result = {"query": query, "question": st["query"], "answer": answer, "claims": claims, "citations": cited, "unsupported": unsupported,
               "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "turn_chars": st["chars"] - chars0, "trace": st["trace"], "thoughts": st["thoughts"],
               "graph": list(st["edges"].values()), "session_id": session_id, "turn": ses["turns"],
               "context_tokens": ctx_now(st), "tokens_spent": st["spent"], "budget": B,
-              "budget_left": max(B - ctx_now(st), 0)}
+              "budget_left": max(B - ctx_now(st), 0), "route": kind}
     core.save_run(mode="harness", **result, timings_ms={k: v for k, v in st["timings"].items() if k != "total"})
     return result | {"timings_ms": st["timings"]}
 

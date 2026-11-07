@@ -193,3 +193,141 @@ def test_llm_step_counts_real_tokens(monkeypatch):
     assert st["pending"] == len("ok") + len('{"q":"x"}')  # старая оценка сброшена точным usage
     st["pending"] += 3000  # ответ инструмента после вызова
     assert harness.ctx_now(st) == 5000 + (2 + 9 + 3000) // harness.CHARS_PER_TOKEN
+
+
+def test_canonical_aliases():
+    from graph import canonical
+    names = {"эйлер", "леонард эйлер", "бернулли", "якоб бернулли", "иоганн бернулли", "якоб ii бернулли", "1738"}
+    assert canonical(names) == {"эйлер": "леонард эйлер"}  # «бернулли» неоднозначно, «якоб бернулли» ≠ «якоб ii»
+
+
+def test_ppr_power_iteration():
+    from graph import ppr
+    # цепочка b—a—c—d, рестарт в b: масса убывает с расстоянием, сумма = 1, r — неподвижная точка уравнения
+    adj = {"a": {"b": 1, "c": 1}, "b": {"a": 1}, "c": {"a": 1, "d": 1}, "d": {"c": 1}, "x": {}}
+    r = ppr(adj, {"b": 1.0}, iters=500, tol=1e-13)
+    assert r["a"] > r["c"] > r["d"] > 0 and r["b"] > r["c"] and "x" not in r
+    assert abs(sum(r.values()) - 1) < 1e-9
+    for u in r:  # r(u) = α·v(u) + (1−α)·Σ r(w)/deg(w) по соседям w
+        assert abs(r[u] - (0.15 * (u == "b") + 0.85 * sum(r[w] / len(adj[w]) for w in adj[u]))) < 1e-9
+    assert ppr(adj, {"нет": 1.0}) == {}
+    iso = ppr(adj, {"x": 1.0})  # висячая вершина: вся масса возвращается в seed
+    assert abs(iso["x"] - 1) < 1e-9
+
+
+def test_passage_scores_split_mass():
+    from graph import passage_scores
+    s = passage_scores({"хаб": 0.5, "узкая": 0.2}, {"хаб": {"p1", "p2", "p3", "p4", "p5"}, "узкая": {"p1"}})
+    assert abs(s["p1"] - 0.3) < 1e-9 and abs(s["p2"] - 0.1) < 1e-9  # хаб делит массу на 5 пассажей
+
+
+def test_paths_rank_short_and_narrow():
+    from graph import paths
+    adj = {"a": {"hub": 1, "m": 1, "b": 1}, "hub": {"a": 1, "b": 1, "x": 1, "y": 1, "z": 1}, "m": {"a": 1, "b": 1},
+           "b": {"a": 1, "hub": 1, "m": 1}, "x": {"hub": 1}, "y": {"hub": 1}, "z": {"hub": 1}}
+    assert paths(adj, "a", "b", 2) == [["a", "b"], ["a", "m", "b"], ["a", "hub", "b"]]  # через хаб — последним
+    assert all(len(set(p)) == len(p) for p in paths(adj, "a", "b", 4))  # только простые пути
+    assert paths(adj, "a", "a") == [] and paths(adj, "a", "нет") == []
+
+
+def test_build_graph_merges_aliases():
+    from graph import build
+    ents = [{"text": "эйлер", "passage_ids": ["p1"]}, {"text": "леонард эйлер", "passage_ids": ["p2"]},
+            {"text": "базель", "passage_ids": ["p1"]}, {"text": "одинокая", "passage_ids": ["p3"]}]
+    rels = [{"id": "r1", "text": "эйлер родился в базель", "src": "эйлер", "dst": "базель", "passage_ids": ["p1"]},
+            {"id": "r2", "text": "леонард эйлер работал в петербург", "src": "леонард эйлер", "dst": "петербург",
+             "passage_ids": ["p2"]}]
+    g = build(ents, rels)
+    assert set(g["adj"]["леонард эйлер"]) == {"базель", "петербург"} and "эйлер" not in g["adj"]
+    assert g["group"]["леонард эйлер"] == ["леонард эйлер", "эйлер"] and g["ent_passages"]["леонард эйлер"] == {"p1", "p2"}
+    assert g["stats"] | {} == {"nodes": 4, "edges": 2, "avg_degree": 1.0, "components": 2, "largest_component": 3, "aliases": 1}
+    assert g["stats_raw"]["components"] == 3  # до склейки граф фрагментирован: эйлер и леонард эйлер — разные
+
+
+def test_ppr_and_paths_tools(monkeypatch):
+    import asyncio
+    import graph
+    import harness
+    rels = [{"id": "r1", "text": "иоганн бернулли учитель леонард эйлер", "src": "иоганн бернулли", "dst": "леонард эйлер", "passage_ids": ["p1"]},
+            {"id": "r2", "text": "леонард эйлер работал в петербург", "src": "леонард эйлер", "dst": "петербург", "passage_ids": ["p2"]}]
+    g = graph.build([{"text": "иоганн бернулли", "passage_ids": ["p1"]}], rels)
+    monkeypatch.setattr(graph, "get", lambda: g)
+    monkeypatch.setattr(harness.core, "get_rows", lambda ids, fields=None: [{"id": i, "text": f"текст {i}", "doc": "d"} for i in ids])
+    st = harness.new_state("q")
+    out = asyncio.run(harness.find_paths(st, "Иоганн Бернулли", "петербург"))
+    assert "иоганн бернулли —учитель→ леонард эйлер —работал в→ петербург  [P1] [P2]" in out
+    assert len(st["edges"]) == 2
+    out = asyncio.run(harness.rank_by_ppr(st, ["иоганн бернулли"], k=2))
+    assert out.startswith("seed: иоганн бернулли\nсущности по PPR") and "леонард эйлер" in out.split("\n")[1]
+    assert "иоганн бернулли учитель леонард эйлер → [P1]" in out
+
+
+def test_eval_hit():
+    from eval import hit
+    assert hit("Учителем был Иоганн Бернулли [P1]", ["иоганн"]) and not hit("Якоб", ["иоганн"])
+    assert hit("В предоставленном контексте нет прямого ответа.", []) and not hit("Иоганн", [])
+
+
+def test_route():
+    from harness import chat_reply, route
+    for q in ["Спасибо!", "Теперь лучше, спасибо", "спасибо большое", "Привет", "ок", "понятно, спасибо", "...", "Добрый день"]:
+        assert route(q, True) == "chat", q
+    for q in ["Опиши проще", "а можно короче?", "объясни попроще, пожалуйста", "перескажи своими словами"]:
+        assert route(q, True) == "rewrite", q
+        assert route(q, False) == "agent", q  # нечего пересказывать — пусть агент ищет
+    for q in ["Кто учитель Эйлера?", "Эйлер", "кратко расскажи про Лагранжа", "Да, а где он родился?"]:
+        assert route(q, True) == "agent", q
+    assert chat_reply("спасибо").startswith("Пожалуйста") and chat_reply("Добрый день").startswith("Здравствуйте")
+
+
+def test_answer_must_fit_question(monkeypatch):
+    import asyncio
+    import harness
+    from types import SimpleNamespace as NS
+
+    async def fake_ask(prompt):
+        return '<think>…</think>[{"n": 1, "off_topic": true}, {"n": 2, "off_topic": false}]'
+    monkeypatch.setattr(harness.core, "ask_llm", fake_ask)
+    st = harness.new_state("Как работает гибридный поиск?")
+    claims = [{"text": "Панели тянутся мышью", "sources": ["P1"]}, {"text": "BM25 + dense + реранкер", "sources": ["P2"]}]
+    assert asyncio.run(harness.off_topic(st, claims)) == [claims[0]]  # верный, но посторонний факт
+
+    async def broken_ask(prompt):
+        return "Оба утверждения [1] и [2] по теме"
+    monkeypatch.setattr(harness.core, "ask_llm", broken_ask)
+    assert asyncio.run(harness.off_topic(st, claims)) == []  # судья сломался — ответ не трогаем
+    st["pid"] = {"P1": "p1", "P2": "p2"}
+    got = harness.lines_to_claims(st, "* **Гибридный** поиск: BM25 + dense [P2]\nбез ссылки\nчужой хэндл [P9]")
+    assert got == [{"text": "Гибридный поиск: BM25 + dense", "sources": ["P2"]}]
+
+    async def fake_chat(msgs, usage=None, **kw):
+        return NS(content="«Как работает гибридный поиск?»\n")
+    monkeypatch.setattr(harness.core, "chat", fake_chat)
+    ses = {"st": st, "questions": ["Как работает гибридный поиск?"], "prev": "Панели тянутся мышью [P1]"}
+    assert asyncio.run(harness.resolve(ses, "Это не ответ на мой вопрос!")) == "Как работает гибридный поиск?"
+    assert asyncio.run(harness.resolve({"st": st}, "Кто такой Эйлер?")) == "Кто такой Эйлер?"  # первый вопрос — без LLM
+
+
+def test_reply_guard():
+    from harness import new_state, render
+    st = new_state("Кто учитель Эйлера?")
+    assert render(st, {"reply": "Иоганн Бернулли"})[2]  # вопрос к базе: reply без источников нельзя
+    st = new_state("Я студент")
+    assert render(st, {"reply": "Хорошо, спрашивайте."}) == ("Хорошо, спрашивайте.", [], [])
+    assert render(st, {"reply": "Эйлер родился в Базеле [P1]"})[2]
+
+
+def test_unlink():
+    from etl import unlink
+    rows = [{"id": "e1", "passage_ids": ["a", "b"]}, {"id": "e2", "passage_ids": ["a"]}]
+    keep, gone = unlink(rows, {"a"})
+    assert keep == [{"id": "e1", "passage_ids": ["b"]}] and gone == ["e2"]
+
+
+def test_graph_part():
+    from harness import graph_part, new_state
+    st = new_state("q")
+    rel = {"id": "r1", "src": "иоганн бернулли", "dst": "леонард эйлер", "text": "иоганн бернулли учитель леонард эйлер", "passage_ids": ["p1"]}
+    out = graph_part(st, [{"text": "леонард эйлер"}], [rel])
+    assert "сущности леонард эйлер" in out and "[P1]" in out and "r1" in st["edges"]  # ребро попало в граф UI
+    assert graph_part(st, [], []) == ""

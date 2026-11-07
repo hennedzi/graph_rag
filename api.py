@@ -3,7 +3,8 @@
 
   uv run uvicorn api:app --port 8200        # один процесс, без --workers: так требует Milvus Lite
 
-  /etl/...       — ETL (etl.py): POST /etl/documents, GET /etl/jobs/{id}, GET /etl/stats
+  /etl/...       — ETL (etl.py): POST /etl/documents, GET /etl/jobs/{id}, GET /etl/stats;
+                   база знаний: GET /etl/documents[/{doc}], DELETE /etl/documents/{doc}, DELETE /etl/passages/{id}
   POST /search   — только retrieval (сущности, отношения, пассажи)
   POST /ask      — retrieval → generation → verification (классический пайплайн)
   POST /harness  — агент с атомарными инструментами (качественнее на multi-hop, экономнее по контексту)
@@ -28,6 +29,7 @@ from pydantic import BaseModel, Field
 
 import core
 import etl
+import graph
 import harness
 from core import timeit
 
@@ -40,6 +42,12 @@ PASSAGES = Histogram("rag_passages_used", "Пассажей в контекст�
 
 class Query(BaseModel):
     query: str = Field(min_length=1, max_length=2000)
+
+
+class Explore(BaseModel):
+    entities: list[str] = Field(min_length=1, max_length=5)
+    k: int = Field(15, ge=1, le=50)
+    max_hops: int = Field(3, ge=1, le=4)
 
 
 class HarnessQuery(Query):
@@ -187,6 +195,45 @@ def dashboard():
     return [{"name": m.name, "type": m.type, "help": m.documentation,
              "samples": [{"name": s.name, "labels": s.labels, "value": s.value} for s in m.samples]}
             for m in REGISTRY.collect() if m.name.startswith(("rag_", "harness_", "etl_"))]
+
+
+@app.get("/graph/stats")
+def graph_stats():
+    """Структура графа после склейки псевдонимов и до неё (raw): эффект канонизации сущностей."""
+    g = graph.get()
+    return {"stats": g["stats"], "stats_raw": g["stats_raw"], "aliases": dict(list(g["alias"].items())[:200])}
+
+
+def edge(g: dict, r: dict) -> dict:
+    """Концы связи — в канонических именах, как вершины ранжирования (иначе «эйлер» и «леонард эйлер» — два узла)."""
+    a = g["alias"]
+    return {"src": a.get(r["src"], r["src"]), "dst": a.get(r["dst"], r["dst"]), "text": r["text"], "handles": []}
+
+
+@app.post("/graph/explore")
+async def graph_explore(q: Explore):
+    """PPR от seed-сущностей + индуцированный подграф топа + пути между первыми двумя seed (для UI «Граф»)."""
+    g, timings = graph.get(), {}
+    with timeit("graph_resolve", timings):
+        seeds = list(dict.fromkeys([e for n in q.entities if (e := await graph.resolve_any(g, n))]))
+    if not seeds:
+        return {"seeds": [], "ranking": [], "edges": [], "paths": [], "passages": [], "timings_ms": timings}
+    with timeit("graph_ppr", timings):
+        r = graph.ppr(g["adj"], dict.fromkeys(seeds, 1.0))
+        top = sorted(r, key=r.get, reverse=True)[:q.k + len(seeds)]
+        ps = sorted(graph.passage_scores(r, g["ent_passages"]).items(), key=lambda x: -x[1])[:8]
+    with timeit("graph_paths", timings):
+        found = graph.paths(g["adj"], seeds[0], seeds[1], q.max_hops) if len(seeds) > 1 else []
+    keep = set(top)
+    edges = [edge(g, rs[0]) for pair, rs in g["rels"].items() if pair <= keep]
+    rows = {p["id"]: p for p in core.get_rows([p for p, _ in ps], ["text", "doc"])}
+    return {"seeds": seeds,
+            "ranking": [{"entity": e, "score": r[e], "passages": len(g["ent_passages"].get(e, ())),
+                         "aliases": [a for a in g["group"].get(e, []) if a != e]} for e in top],
+            "edges": edges,
+            "paths": [[edge(g, graph.relation_between(g, a, b)) for a, b in zip(p, p[1:])] for p in found],
+            "passages": [rows[p] | {"score": s} for p, s in ps if p in rows],
+            "timings_ms": timings}
 
 
 @app.get("/stats")

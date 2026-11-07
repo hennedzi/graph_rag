@@ -1,8 +1,10 @@
-import { BookOpen, CheckCheck, Database, FileSearch, ScanSearch, Share2, Wrench, type LucideIcon } from "lucide-react";
+import { BookOpen, CheckCheck, Database, FileSearch, Orbit, Route, ScanSearch, Share2, Wrench, type LucideIcon } from "lucide-react";
 
 export const TOOLS: Record<string, { icon: LucideIcon; label: string; color: string; hint: string }> = {
   find_entities: { icon: ScanSearch, label: "find_entities", color: "var(--chart-4)", hint: "сущности по смыслу" },
   neighbors: { icon: Share2, label: "neighbors", color: "var(--chart-2)", hint: "связи графа, 1–2 хопа" },
+  rank_by_ppr: { icon: Orbit, label: "rank_by_ppr", color: "var(--chart-2)", hint: "Personalized PageRank по графу" },
+  find_paths: { icon: Route, label: "find_paths", color: "var(--chart-4)", hint: "цепочки связей между двумя" },
   query_db: { icon: Database, label: "query_db", color: "var(--chart-3)", hint: "фильтр-выражение Milvus" },
   search_passages: { icon: FileSearch, label: "search_passages", color: "var(--chart-1)", hint: "гибрид dense+BM25 + реранк" },
   read_passage: { icon: BookOpen, label: "read_passage", color: "var(--chart-5)", hint: "полный текст по P#" },

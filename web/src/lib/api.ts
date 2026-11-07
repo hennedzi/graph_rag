@@ -22,6 +22,7 @@ export const postJson = <T,>(path: string, body: unknown) =>
   fetch(url(path), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then(
     (r) => ok<T>(r),
   );
+export const del = <T,>(path: string) => fetch(url(path), { method: "DELETE" }).then((r) => ok<T>(r));
 export const upload = (files: File[]) => {
   const fd = new FormData();
   files.forEach((f) => fd.append("files", f));
@@ -39,6 +40,8 @@ export type Claim = { text: string; sources: string[] };
 export type Citation = { doc_id: string; doc: string; text: string };
 export type HarnessResult = {
   query: string;
+  /** agent — цикл с инструментами; chat — реплика без поиска; rewrite — пересказ прошлого ответа */
+  route?: "agent" | "chat" | "rewrite" | "rewrite_fallback";
   answer: string;
   claims: Claim[];
   citations: Record<string, Citation>;
@@ -84,6 +87,7 @@ export type Job = {
   chunks: number;
   triples?: number;
   rows_written?: number;
+  replaced?: number;
   error?: string;
   timings_ms?: Timings;
 };
@@ -160,3 +164,37 @@ export function buckets(m: Metric[] | undefined, name: string) {
 export const fmtMs = (ms?: number | null) =>
   ms == null ? "—" : ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)} с` : `${Math.round(ms)} мс`;
 export const fmtNum = (n?: number | null) => (n == null ? "—" : n.toLocaleString("ru-RU"));
+
+// ─── Граф: PPR и пути (/graph/*) ────────────────────────────────
+export type GraphStats = { nodes: number; edges: number; avg_degree: number; components: number; largest_component: number; aliases?: number };
+export type GraphInfo = { stats: GraphStats; stats_raw: GraphStats; aliases: Record<string, string> };
+export type GraphExplore = {
+  seeds: string[];
+  ranking: { entity: string; score: number; passages: number; aliases: string[] }[];
+  edges: Edge[];
+  paths: Edge[][];
+  passages: Passage[];
+  timings_ms: Timings;
+};
+
+// ─── База знаний: документы (/etl/documents) ────────────────────
+export type DocSummary = {
+  doc: string;
+  passages: number;
+  entities: number;
+  relations: number;
+  /** сущности, которые встречаются и в других документах — «мосты» графа */
+  shared: number;
+  chars: number;
+  uploaded_at?: string;
+  bytes?: number;
+  triples?: number;
+};
+export type DocDetail = {
+  doc: string;
+  meta: { uploaded_at?: string; bytes?: number; chunks?: number; triples?: number };
+  passages: { id: string; text: string; entities: string[]; relations: number }[];
+  entities: { name: string; here: number; total: number }[];
+  relations: { src: string; dst: string; text: string; passages: string[] }[];
+};
+export type Dropped = { passages: number; entities: number; relations: number };

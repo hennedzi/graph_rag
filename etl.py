@@ -13,6 +13,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -23,12 +24,16 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
 from prometheus_client import Counter, Gauge, make_asgi_app
 
 import core
+import graph
 from core import cfg, log, normalize, timeit, uid
 
 CHUNK_CHARS = cfg.getint("etl", "chunk_chars")
 MAX_BYTES = cfg.getint("etl", "max_upload_mb") * 1024 * 1024
 MAX_NAME = 200
 UPSERT_BATCH = 1000  # ~4 МБ на батч при dim=1024, далеко от лимита gRPC
+IN_BATCH = 500  # хэндлов в одном array_contains_any — фильтр остаётся коротким
+# Метаданные документов (дата, размер, порядок чанков): в схеме Milvus их нет, а пересоздавать коллекцию ради них дорого.
+REGISTRY = Path(cfg.get("etl", "registry", fallback="documents.json"))
 
 DOCS = Counter("etl_documents_total", "Документы по итогу обработки", ["status"])
 CHUNKS = Counter("etl_chunks_total", "Чанки, прошедшие через ETL")
@@ -156,11 +161,106 @@ async def ingest(doc: str, items: list[dict], timings: dict) -> dict:
         with timeit("etl_upsert", timings):
             for i in range(0, len(rows), UPSERT_BATCH):
                 core.milvus.upsert(core.COLLECTION, rows[i:i + UPSERT_BATCH])
+        # повторная загрузка документа = замена: пассажи прошлой версии, которых больше нет, вычищаются из графа
+        stale = {r["id"] for r in graph.scan("passage", [], f"doc == {json.dumps(doc)}")} - set(pids)
+        removed = drop_passages(stale)
+        graph.invalidate()  # новые связи и passage_ids — граф для PPR/путей пересоберётся при следующем запросе
     for t in ("passage", "entity", "relation"):
         ROWS.labels(t).inc(sum(r["type"] == t for r in rows))
 
-    return {"doc": doc, "chunks": len(texts), "triples": sum(map(len, triples)),
-            "entities": len(ent), "relations": len(rel), "rows_written": len(rows), "embedded": len(fresh)}
+    return {"doc": doc, "chunks": len(texts), "triples": sum(map(len, triples)), "entities": len(ent),
+            "relations": len(rel), "rows_written": len(rows), "embedded": len(fresh), "replaced": removed["passages"],
+            "order": list(dict.fromkeys(pids))}
+
+
+# ─── Управление базой: удаление пассажей и документов ──────────
+def linked(kind: str, pids: list[str], fields: list[str]) -> list[dict]:
+    """Сущности/связи, упомянутые хотя бы в одном из пассажей pids."""
+    out = {}
+    for i in range(0, len(pids), IN_BATCH):
+        for r in graph.scan(kind, fields, f"array_contains_any(passage_ids, {json.dumps(pids[i:i + IN_BATCH])})"):
+            out[r["id"]] = r
+    return list(out.values())
+
+
+def unlink(rows: list[dict], pids: set[str]) -> tuple[list[dict], list[str]]:
+    """Чистая часть удаления: из passage_ids убираем pids; строки без пассажей — на удаление."""
+    keep, gone = [], []
+    for r in rows:
+        left = [p for p in r["passage_ids"] if p not in pids]
+        (keep.append(r | {"passage_ids": left}) if left else gone.append(r["id"]))
+    return keep, gone
+
+
+def drop_passages(pids: set[str]) -> dict:
+    """Удалить пассажи и вычистить их из графа. Вызывать под _write_lock."""
+    if not pids:
+        return {"passages": 0, "entities": 0, "relations": 0}
+    fields = ["text", "type", "doc", "src", "dst", "passage_ids", "dense"]
+    rows = linked("entity", list(pids), fields) + linked("relation", list(pids), fields)
+    keep, gone = unlink(rows, pids)
+    for i in range(0, len(keep), UPSERT_BATCH):
+        core.milvus.upsert(core.COLLECTION, keep[i:i + UPSERT_BATCH])
+    core.milvus.delete(core.COLLECTION, ids=[*pids, *gone])
+    graph.invalidate()
+    by = {r["id"]: r["type"] for r in rows}
+    return {"passages": len(pids), "entities": sum(by[i] == "entity" for i in gone),
+            "relations": sum(by[i] == "relation" for i in gone)}
+
+
+def registry() -> dict:
+    return json.loads(REGISTRY.read_text()) if REGISTRY.exists() else {}
+
+
+def register(doc: str, meta: dict | None):
+    reg = registry()
+    if meta is None:
+        reg.pop(doc, None)
+    else:
+        reg[doc] = reg.get(doc, {}) | meta
+    REGISTRY.write_text(json.dumps(reg, ensure_ascii=False, indent=1))
+
+
+def library() -> list[dict]:
+    """Документы базы: что в Milvus (пассажи, сущности, связи) + метаданные загрузки."""
+    passages = graph.scan("passage", ["doc", "text"])
+    doc_of, chars = {r["id"]: r["doc"] for r in passages}, defaultdict(int)
+    for r in passages:
+        chars[r["doc"]] += len(r["text"])
+    per = {d: {"passages": 0, "entities": 0, "relations": 0, "shared": 0} for d in chars}
+    for d in doc_of.values():
+        per[d]["passages"] += 1
+    for kind in ("entity", "relation"):
+        for r in graph.scan(kind, ["passage_ids"]):
+            docs = {doc_of[p] for p in r["passage_ids"] if p in doc_of}
+            for d in docs:
+                per[d]["entities" if kind == "entity" else "relations"] += 1
+                per[d]["shared"] += kind == "entity" and len(docs) > 1
+    reg = registry()
+    return sorted(({"doc": d, "chars": chars[d], **c, **{k: v for k, v in reg.get(d, {}).items() if k != "order"}}
+                   for d, c in per.items()), key=lambda x: x.get("uploaded_at", ""), reverse=True)
+
+
+def document(doc: str) -> dict | None:
+    ps = graph.scan("passage", ["text"], f"doc == {json.dumps(doc)}")
+    if not ps:
+        return None
+    pids = [p["id"] for p in ps]
+    ents = linked("entity", pids, ["text", "passage_ids"])
+    rels = linked("relation", pids, ["text", "src", "dst", "passage_ids"])
+    mine = set(pids)
+    order = {p: i for i, p in enumerate(registry().get(doc, {}).get("order", []))}
+    ps.sort(key=lambda p: order.get(p["id"], len(order)))
+    return {
+        "doc": doc, "meta": {k: v for k, v in registry().get(doc, {}).items() if k != "order"},
+        "passages": [{"id": p["id"], "text": p["text"],
+                      "entities": [e["text"] for e in ents if p["id"] in e["passage_ids"]],
+                      "relations": sum(p["id"] in r["passage_ids"] for r in rels)} for p in ps],
+        "entities": sorted(({"name": e["text"], "here": len(mine & set(e["passage_ids"])),
+                             "total": len(e["passage_ids"])} for e in ents), key=lambda e: -e["here"]),
+        "relations": [{"src": r["src"], "dst": r["dst"], "text": r["text"],
+                       "passages": [p for p in r["passage_ids"] if p in mine]} for r in rels],
+    }
 
 
 def parse_upload(name: str, data: bytes) -> list[dict]:
@@ -188,6 +288,8 @@ async def run_job(job_id: str, doc: str, items: list[dict]):
     job["status"] = "running"
     try:
         job |= await ingest(doc, items, timings) | {"status": "done"}
+        register(doc, {"uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "bytes": job.get("bytes", 0),
+                       "chunks": job["chunks"], "triples": job["triples"], "order": job.pop("order")})
         DOCS.labels("done").inc()
         log.info("ETL %s: %s", doc, {k: job[k] for k in ("chunks", "triples", "rows_written")})
     except Exception as e:  # граница фоновой задачи: любая ошибка → статус failed, а не вечный running
@@ -228,10 +330,44 @@ async def upload(files: list[UploadFile], background: BackgroundTasks):
         if not items:
             raise HTTPException(422, f"{f.filename}: пустой документ")
         job_id = uuid.uuid4().hex
-        JOBS[job_id] = {"job_id": job_id, "doc": f.filename, "status": "queued", "chunks": len(items)}
+        JOBS[job_id] = {"job_id": job_id, "doc": f.filename, "status": "queued", "chunks": len(items), "bytes": len(data)}
         background.add_task(run_job, job_id, f.filename[:512], items)
         jobs.append(JOBS[job_id])
     return jobs
+
+
+@app.get("/documents")
+def documents():
+    return library()
+
+
+@app.get("/documents/{doc:path}")
+def document_detail(doc: str):
+    if not (d := document(doc)):
+        raise HTTPException(404, "нет такого документа")
+    return d
+
+
+@app.delete("/documents/{doc:path}")
+async def delete_document(doc: str):
+    """Удалить документ: пассажи, а у сущностей и связей — ссылки на них; осиротевшие сущности и связи тоже."""
+    async with _write_lock:
+        pids = {r["id"] for r in graph.scan("passage", [], f"doc == {json.dumps(doc)}")}
+        if not pids:
+            raise HTTPException(404, "нет такого документа")
+        out = drop_passages(pids)
+    register(doc, None)
+    log.info("Удалён документ %s: %s", doc, out)
+    return out
+
+
+@app.delete("/passages/{pid}")
+async def delete_passage(pid: str):
+    """Удалить один пассаж (неудачный чанк) вместе с фактами, которые держались только на нём."""
+    async with _write_lock:
+        if not core.get_rows([pid], ["type"]):
+            raise HTTPException(404, "нет такого пассажа")
+        return drop_passages({pid})
 
 
 @app.get("/jobs")
@@ -261,7 +397,10 @@ async def _seed():
     from dataset import DATASET
     core.ensure_collection()
     timings = {}
-    print(await ingest("dataset.py", list(DATASET), timings), timings, core.counts())
+    r = await ingest("dataset.py", list(DATASET), timings)
+    register("dataset.py", {"uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "chunks": r["chunks"],
+                            "triples": r["triples"], "order": r.pop("order")})
+    print(r, timings, core.counts())
 
 
 if __name__ == "__main__":
