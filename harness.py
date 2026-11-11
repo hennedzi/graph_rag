@@ -148,7 +148,8 @@ TOOLS = [
 # ─── Состояние сессии: хэндлы P# ↔ id в Milvus ─────────────────
 def new_state(query: str = "") -> dict:
     return {"query": query, "qvec": None, "pid": {}, "handle": {}, "text": {}, "read": set(), "chars": 0, "ctx": 0, "pending": 0, "spent": 0, "budget": BUDGET,
-            "trace": [], "thoughts": [], "timings": {}, "doc": {}, "edges": {}, "emit": None}
+            "trace": [], "thoughts": [], "timings": {}, "doc": {}, "edges": {}, "emit": None,
+            "run_id": "", "seq": 0, "events": [], "cancel": False, "scope": None, "verify_error": False}
 
 
 def handle(st: dict, pid: str) -> str:
@@ -249,10 +250,18 @@ async def neighbors(st, entity: str, hops: int = 1) -> str:
     return out
 
 
+def scope_where(st) -> str:
+    # shortcut: область поиска фильтрует пассажи (у них есть doc); сущности и рёбра общие на базу —
+    # поля doc у них нет, фильтрации графа по документу пока нет, FUTURE §7/D.
+    return f"doc == {json.dumps(st['scope'])}" if st.get("scope") else ""
+
+
 async def query_db(st, kind: str, filter: str = "", query: str = "", count: bool = False, k: int = 10) -> str:
     if kind not in ("passage", "entity", "relation"):
         raise ValueError("kind: passage | entity | relation")
     where = check_filter(st, filter)
+    if kind == "passage" and (sw := scope_where(st)):
+        where = sw + (f" and ({where})" if where else "")
     expr = f'type == "{kind}"' + (f" and ({where})" if where else "")
     if count:
         return f"строк: {core.milvus.query(core.COLLECTION, filter=expr, output_fields=['count(*)'])[0]['count(*)']}"
@@ -297,7 +306,11 @@ async def search_passages(st, query: str, k: int = 3) -> str:
     часто ниже него. Агенту лучше увидеть 3 слабых превью с пометкой, чем «ничего» и поиск по кругу.
     """
     ents, rels, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10), min_score=float("-inf"))
+    if st.get("scope"):  # область поиска: пассажи только из выбранного документа
+        ps = [p for p in ps if p["doc"] == st["scope"]]
     head = graph_part(st, ents, rels)
+    if st.get("scope"):
+        head = f"(область: пассажи только из {st['scope']}; граф и сущности — по всей базе)\n" + head
     strong = [p for p in ps if p["score"] >= core.MIN_RERANK_SCORE]
     if strong:
         return head + passage_lines(st, strong)
@@ -455,10 +468,15 @@ async def chat_tools(msgs: list[dict], usage: dict | None = None):
 
 
 async def check(st, text: str) -> list[dict]:
-    """Верификация по процитированным пассажам (подгружаем, даже если агент их не читал)."""
+    """Верификация по процитированным пассажам (подгружаем, даже если агент их не читал).
+    None от verify = проверка не выполнена: это не «всё подтверждено» и не «в документах нет»."""
     cited = [h for h in st["pid"] if f"[{h}]" in text]
     await read_passage(st, [h for h in cited if h not in st["read"]])
-    return await core.verify(text, {h: st["text"].get(st["pid"][h], "") for h in cited})
+    res = await core.verify(text, {h: st["text"].get(st["pid"][h], "") for h in cited})
+    if res is None:
+        st["verify_error"] = True
+        return []
+    return res
 
 
 RELEVANT_PROMPT = """Вопрос: {q}
@@ -543,9 +561,12 @@ def short(text, n: int = LOG_CHARS) -> str:
 
 
 async def emit(st, type: str, **ev):
-    """Событие для живого UI (/harness/stream); без подписчика — no-op."""
+    """Событие получает seq и попадает в журнал запуска (st["events"] → run JSON); живой UI получает то же самое."""
+    st["seq"] += 1
+    ev = {"seq": st["seq"], "type": type, **ev}
+    st["events"].append(ev)
     if st["emit"]:
-        await st["emit"]({"type": type, **ev})
+        await st["emit"](ev)
 
 
 def say(sid: str, fmt: str, *args):
@@ -564,7 +585,7 @@ class SessionError(Exception):
     """Сессию нельзя продолжить: не найдена/истекла или по ней уже идёт вопрос."""
 
 
-def open_session(session_id: str | None, query: str) -> tuple[str, dict]:
+def open_session(session_id: str | None, query: str, scope: str | None = None) -> tuple[str, dict]:
     now = time.monotonic()
     for k in [k for k, v in SESSIONS.items() if now - v["used"] > SESSION_TTL and not v["busy"]]:
         del SESSIONS[k]
@@ -583,11 +604,21 @@ def open_session(session_id: str | None, query: str) -> tuple[str, dict]:
     ses.update(busy=True, used=now)
     st = ses["st"]
     # пер-вопросные поля сбрасываем; хэндлы, тексты, прочитанное, рёбра и бюджет — общие на диалог
-    st.update(query=query, qvec=None, trace=[], thoughts=[], timings={}, spent=0)
+    st.update(query=query, qvec=None, trace=[], thoughts=[], timings={}, spent=0,
+              run_id=uuid.uuid4().hex[:12], seq=0, events=[], cancel=False, verify_error=False, scope=scope)
     hint = f"\n(уже прочитаны: {' '.join(sorted(st['read'], key=lambda h: int(h[1:])))})" if st["read"] else ""
     ses["msgs"].append({"role": "user", "content": query + hint})
     ses["turns"] += 1
     return session_id, ses
+
+
+def cancel_run(session_id: str) -> bool:
+    """Остановка запуска: текущий вызов провайдера дорабатывает (прервать его нельзя), новых шагов не будет."""
+    ses = SESSIONS.get(session_id)
+    if not ses or not ses["busy"]:
+        return False
+    ses["st"]["cancel"] = True
+    return True
 
 
 LIMIT: dict = {}
@@ -658,6 +689,8 @@ CHAT_REPLY = {
 REWRITE = re.compile(r"\b(?:попроще|проще|покороче|короче|кратко|кратче|вкратце|в двух словах|своими словами|понятнее|"
                      r"перефразир\w*|переформулир\w*|упрост\w*|списком|по пунктам|одним предложением|"
                      r"по-английски|на английском)\b")
+# «короче» должно реально сокращать (FUTURE §7); «проще» честно не измерить — принимаем пересказ с источниками
+SHORTEN = re.compile(r"\b(?:покороче|короче|кратко|кратче|вкратце|в двух словах|одним предложением)\b")
 FILLER = {"опиши", "объясни", "расскажи", "скажи", "сделай", "напиши", "перескажи", "изложи", "сформулируй", "ответь",
           "можно", "можешь", "попробуй", "давай", "пожалуйста", "а", "ну", "и", "это", "то", "же", "так", "ли", "еще",
           "ответ", "мне", "чуть", "немного", "его", "как", "нибудь", "по", "сказать", "надо", "нужно", "лучше", "ты"}
@@ -711,14 +744,31 @@ async def quick(query: str, kind: str, st: dict, ses: dict) -> tuple[str, list[d
     st["spent"] += u.get("prompt", 0) + u.get("completion", 0)
     with timeit("harness_verify", st["timings"]):
         bad = await check(st, text) if re.search(r"\[P\d+\]", text) else [{"claim": "в пересказе пропали ссылки [P#]"}]
-    if bad:  # пересказ что-то добавил или потерял источники — честнее отдать прошлый проверенный ответ
-        return f"Проще пересказать без потери точности не вышло, прошлый ответ:\n{last}", [], "rewrite_fallback"
+    if bad or st["verify_error"]:  # пересказ не проверен или не прошёл проверку — честнее отдать прошлый проверенный ответ
+        return f"Пересказать без потери точности не вышло, прошлый ответ:\n{last}", [], "rewrite_fallback"
+    if SHORTEN.search(" ".join(words(query))) and len(text) >= len(last):
+        return f"Пересказ не стал короче, прошлый ответ:\n{last}", [], "rewrite_fallback"
     return text, [], "rewrite"
 
 
 # ─── Цикл агента ───────────────────────────────────────────────
-async def run(query: str, on_event=None, session_id: str | None = None) -> dict:
-    session_id, ses = open_session(session_id, query)
+def outcome_of(answer: str, claims: list[dict], unsupported: list, cancelled: bool,
+               steps_exhausted: bool, verify_error: bool) -> tuple[str, str]:
+    """Машинная причина завершения + сообщение из реального результата, не из рассказа модели (FUTURE §4)."""
+    if cancelled:
+        return "cancelled", "остановлено пользователем; накопленные материалы сохранены"
+    if verify_error:
+        return "verification_failed", "проверяющая модель не ответила — опора на источники не проверена"
+    if not claims:
+        return ("budget_exceeded", "достигнут лимит шагов — ответа не нашлось") if steps_exhausted \
+            else ("no_evidence", "в прочитанных документах нет ответа на вопрос")
+    if unsupported:
+        return "partial", f"ответ частичный: {len(unsupported)} утверждений не подтверждены источниками"
+    return "answered", "утверждения ответа подтверждены источниками"
+
+
+async def run(query: str, on_event=None, session_id: str | None = None, doc: str | None = None) -> dict:
+    session_id, ses = open_session(session_id, query, scope=doc)
     try:
         if (kind := route(query, bool(ses.get("last")))) != "agent":
             return await _quick(query, kind, on_event, session_id, ses)
@@ -750,13 +800,16 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     st["emit"] = on_event
     say(sid, "вопрос #%d: %s", ses["turns"], query)
     await emit(st, "start", query=query, budget=B, max_steps=MAX_STEPS, session_id=session_id,
-               turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()))
+               turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()),
+               run_id=st["run_id"], scope=st["scope"])
     if seeds:
         st["thoughts"].append({"step": 0, "text": f"Сущности вопроса в графе: {seeds}"})
         await emit(st, "thought", step=0, text=f"Сущности вопроса в графе: {seeds}")
     answer, unsupported, fixes, steps, claims = None, [], 0, 0, []
 
     while answer is None and steps < MAX_STEPS:
+        if st["cancel"]:  # остановка: новых вызовов модели и инструментов не будет
+            break
         steps += 1
         with timeit("harness_llm", st["timings"]):
             msg = await llm_step(st, msgs)
@@ -840,7 +893,9 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                 close_calls(msgs, calls, done)
                 break
 
-    if answer is None:  # шаги кончились — просим ответ без инструментов, но проверяем так же, как answer
+    if answer is None and st["cancel"]:
+        answer = "Запуск остановлен на шаге {0}. Прочитанные материалы и подграф — в инспекторе.".format(steps)
+    elif answer is None:  # шаги кончились — просим ответ без инструментов, но проверяем так же, как answer
         msgs.append({"role": "user", "content": f"Шаги закончились. Ответь на вопрос «{st['query']}» по прочитанным "
                      "пассажам: один факт в строке, в конце строки ссылки [P#], без markdown. "
                      f"Если ответа на этот вопрос в прочитанном нет — ответь: {core.NO_CONTEXT}"})
@@ -853,10 +908,8 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
         claims = [c for c in claims if c not in off]
         answer = fmt(claims) or core.NO_CONTEXT
         unsupported = unsupported if claims else []
-        OUTCOME.labels("max_steps").inc()
-    else:
-        OUTCOME.labels("no_context" if answer.startswith(core.NO_CONTEXT[:30])
-                       else "unsupported" if unsupported else "answered").inc()
+    outcome, note = outcome_of(answer, claims, unsupported, st["cancel"], steps >= MAX_STEPS, st["verify_error"])
+    OUTCOME.labels(outcome).inc()
 
     say(sid, "итог за %d шагов, окно %d/%d токенов, потрачено %d токенов, неподтверждённых %d: %s",
         steps, ctx_now(st), B, st["spent"], len(unsupported), short(answer))
@@ -870,23 +923,27 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     CONTEXT_TOKENS.observe(ctx_now(st))
     SPENT_TOKENS.observe(st["spent"])
     UNSUPPORTED.inc(len(unsupported))
-    return finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, "agent")
+    return finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, "agent", outcome, note)
 
 
 async def _quick(query: str, kind: str, on_event, session_id: str, ses: dict) -> dict:
     st, t0, chars0 = ses["st"], time.perf_counter(), ses["st"]["chars"]
     st["budget"], st["emit"] = await budget(), on_event
     await emit(st, "start", query=query, budget=st["budget"], max_steps=0, session_id=session_id, route=kind,
-               turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()))
+               turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()),
+               run_id=st["run_id"], scope=st["scope"])
     answer, unsupported, kind = await quick(query, kind, st, ses)
     ses["msgs"].append({"role": "assistant", "content": answer})  # агент увидит реплику в следующем вопросе
     st["pending"] += len(ses["msgs"][-2]["content"]) + len(answer)
-    OUTCOME.labels(kind).inc()
+    outcome = "verification_failed" if kind == "rewrite_fallback" else "answered"
+    note = {"chat": "реплика без поиска", "rewrite": "пересказ прошлого ответа без нового поиска",
+            "rewrite_fallback": "пересказ не прошёл проверку — показан прошлый проверенный ответ"}.get(kind, "")
+    OUTCOME.labels(outcome).inc()
     say(session_id[:6], "без поиска (%s): %s", kind, short(answer))
-    return finish(st, ses, session_id, query, answer, [], unsupported, 0, 0, chars0, t0, kind)
+    return finish(st, ses, session_id, query, answer, [], unsupported, 0, 0, chars0, t0, kind, outcome, note)
 
 
-def finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, kind) -> dict:
+def finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, kind, outcome, note) -> dict:
     B = st["budget"]
     st["timings"]["total"] = round((time.perf_counter() - t0) * 1000, 1)
     cited = {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
@@ -895,7 +952,13 @@ def finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes
               "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "turn_chars": st["chars"] - chars0, "trace": st["trace"], "thoughts": st["thoughts"],
               "graph": list(st["edges"].values()), "session_id": session_id, "turn": ses["turns"],
               "context_tokens": ctx_now(st), "tokens_spent": st["spent"], "budget": B,
-              "budget_left": max(B - ctx_now(st), 0), "route": kind}
+              "budget_left": max(B - ctx_now(st), 0), "route": kind,
+              "run_id": st["run_id"], "scope": st["scope"], "outcome": outcome, "outcome_note": note,
+              "read": {h: {"doc": st["doc"].get(st["pid"].get(h, ""), ""),
+                          "text": st["text"].get(st["pid"].get(h, ""), "")}
+                       for h in sorted(st["read"], key=lambda x: int(x[1:]))},
+              # живой стрим и сохранённый run показывают одни и те же шаги; edges уже есть в graph — не дублируем
+              "events": [{k: v for k, v in e.items() if k != "edges"} for e in st["events"]]}
     core.save_run(mode="harness", **result, timings_ms={k: v for k, v in st["timings"].items() if k != "total"})
     return result | {"timings_ms": st["timings"]}
 

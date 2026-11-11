@@ -52,6 +52,11 @@ class Explore(BaseModel):
 
 class HarnessQuery(Query):
     session_id: str | None = Field(None, max_length=64, description="продолжить диалог: id из прошлого ответа")
+    doc: str | None = Field(None, max_length=512, description="область поиска: один документ; не задано — все документы")
+
+
+class StopQuery(BaseModel):
+    session_id: str = Field(min_length=1, max_length=64)
 
 
 @asynccontextmanager
@@ -111,19 +116,35 @@ async def ask(q: Query):
         answer = await core.generate(q.query, texts)
     with timeit("verification", timings):
         unsupported = await core.verify(answer, {str(i): t for i, t in enumerate(texts, 1)})
+    verified = unsupported is not None  # None — верификатор не ответил; это не «всё подтверждено»
+    unsupported = unsupported or []
 
     UNSUPPORTED.inc(len(unsupported))
-    REQUESTS.labels("ask", "unsupported" if unsupported else "answered").inc()
+    REQUESTS.labels("ask", "unchecked" if not verified else "unsupported" if unsupported else "answered").inc()
+    outcome = ("verification_failed", "no_evidence", "partial", "answered")[
+        0 if not verified else 1 if not unsupported and answer.startswith(core.NO_CONTEXT[:30])
+        else 2 if unsupported else 3]
     run = core.save_run(mode="ask", query=q.query, answer=answer, sources=ps, unsupported=unsupported,
-                        entities=[e["text"] for e in ents], relations=[r["text"] for r in rels], timings_ms=timings)
-    return {"answer": answer, "sources": ps, "unsupported": unsupported, "timings_ms": timings, "run": run.name}
+                        entities=[e["text"] for e in ents], relations=[r["text"] for r in rels], timings_ms=timings,
+                        outcome=outcome)
+    return {"answer": answer, "sources": ps, "unsupported": unsupported, "verified": verified,
+            "outcome": outcome, "timings_ms": timings, "run": run.name}
 
 
 @app.post("/harness")
 async def ask_harness(q: HarnessQuery):
-    r = await harness.run(q.query, session_id=q.session_id)
-    REQUESTS.labels("harness", "unsupported" if r["unsupported"] else "answered").inc()
+    r = await harness.run(q.query, session_id=q.session_id, doc=q.doc)
+    REQUESTS.labels("harness", r.get("outcome") or "answered").inc()
     return r
+
+
+@app.post("/harness/stop")
+def harness_stop(q: StopQuery):
+    """Остановка запуска по сессии: текущий вызов модели дорабатывает, новые шаги не запускаются.
+    Итог — outcome=cancelled, накопленные материалы сохраняются в run."""
+    if not harness.cancel_run(q.session_id):
+        return JSONResponse({"detail": "по этой сессии нет активного запуска"}, status_code=404)
+    return {"ok": True}
 
 
 @app.post("/harness/stream")
@@ -133,8 +154,8 @@ async def harness_stream(q: HarnessQuery):
 
     async def work():
         try:
-            r = await harness.run(q.query, on_event=events.put, session_id=q.session_id)
-            REQUESTS.labels("harness", "unsupported" if r["unsupported"] else "answered").inc()
+            r = await harness.run(q.query, on_event=events.put, session_id=q.session_id, doc=q.doc)
+            REQUESTS.labels("harness", r.get("outcome") or "answered").inc()
             await events.put({"type": "done", "result": r})
         except harness.SessionError as e:
             await events.put({"type": "error", "detail": str(e), "session": "lost"})
@@ -143,7 +164,8 @@ async def harness_stream(q: HarnessQuery):
                 core.MODEL_ERRORS.labels("harness").inc()
             REQUESTS.labels("harness", "error").inc()
             core.log.exception("Ошибка в /harness/stream")
-            await events.put({"type": "error", "detail": f"{type(e).__name__}: {e}"})
+            await events.put({"type": "error", "detail": f"{type(e).__name__}: {e}",
+                              "outcome": "dependency_error" if isinstance(e, openai.APIError) else "error"})
         finally:
             await events.put(None)
 
@@ -165,6 +187,8 @@ def run_summary(path: Path) -> dict:
             "total_ms": r.get("total_ms"), "timings_ms": r.get("timings_ms", {}), "steps": r.get("steps"),
             "context_chars": r.get("context_chars"), "unsupported": len(r.get("unsupported") or []),
             "answer": r.get("answer", ""), "tools": [t["tool"] for t in r.get("trace", [])],
+            "outcome": r.get("outcome"), "scope": r.get("scope"),
+            "events": bool(r.get("events")),  # False = старый формат, диагностика неполная
             "top_score": max((s.get("score", 0) for s in r.get("sources") or []), default=None)}
 
 

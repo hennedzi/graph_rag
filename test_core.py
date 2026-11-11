@@ -135,12 +135,13 @@ def test_emit_without_listener_is_noop():
     from harness import emit, new_state
     st, got = new_state(), []
     asyncio.run(emit(st, "start", query="q"))
+    assert st["events"][0]["seq"] == 1  # событие попало в журнал запуска и без подписчика
 
     async def put(ev):
         got.append(ev)
     st["emit"] = put
     asyncio.run(emit(st, "call", tool="neighbors"))
-    assert got == [{"type": "call", "tool": "neighbors"}]
+    assert got == [{"seq": 2, "type": "call", "tool": "neighbors"}]  # живой UI и журнал получают одно и то же
 
 
 def test_run_summary(tmp_path):

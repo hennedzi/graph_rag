@@ -286,8 +286,8 @@ async def generate(query: str, texts: list[str]) -> str:
     return await ask_llm(ANSWER_PROMPT.format(context=context, query=query))
 
 
-async def verify(answer: str, sources: dict[str, str]) -> list[dict]:
-    """sources: метка → текст. Возвращает неподтверждённые утверждения."""
+async def verify(answer: str, sources: dict[str, str]) -> list[dict] | None:
+    """sources: метка → текст. Возвращает неподтверждённые утверждения; None — проверка не выполнена."""
     if not answer or not sources or answer.startswith(NO_CONTEXT[:30]):
         return []
     block = "\n".join(f"[{k}] {t}" for k, t in sources.items())
@@ -295,5 +295,5 @@ async def verify(answer: str, sources: dict[str, str]) -> list[dict]:
     if not isinstance(checks, list):
         log.warning("Верификатор вернул невалидный JSON")
         MODEL_ERRORS.labels("verify_json").inc()
-        return []
+        return None
     return [c for c in checks if isinstance(c, dict) and c.get("supported") is False]
