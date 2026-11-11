@@ -132,7 +132,7 @@ function AskAnswer({ t }: { t: Turn }) {
             <SourceBadge key={p.id} h={String(i + 1)} cite={{ doc_id: p.id, doc: p.doc, text: p.text }} />
           ))}
         </div>
-        <Verdict unsupported={t.ask.unsupported} />
+        <Verdict unsupported={t.ask.unsupported} outcome={t.ask.outcome} />
         <Timeline t={t.ask.timings_ms} />
       </CardContent>
     </Card>

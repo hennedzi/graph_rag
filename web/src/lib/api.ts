@@ -33,7 +33,9 @@ export const upload = (files: File[]) => {
 export type Passage = { id: string; doc: string; text: string; score: number };
 export type SearchResult = { entities: string[]; relations: string[]; passages: Passage[]; timings_ms: Timings };
 export type Unsupported = { claim?: string; reason?: string };
-export type AskResult = { answer: string; sources: Passage[]; unsupported: Unsupported[]; timings_ms: Timings };
+/** Итог запуска с backend (FUTURE §4); в старых runs поля нет — диагностика неполная. */
+export type Outcome = "answered" | "partial" | "no_evidence" | "verification_failed" | "budget_exceeded" | "cancelled" | "dependency_error";
+export type AskResult = { answer: string; sources: Passage[]; unsupported: Unsupported[]; timings_ms: Timings; outcome?: Outcome };
 export type Timings = Record<string, number>;
 export type Edge = { src: string; dst: string; text: string; handles: string[] };
 export type Claim = { text: string; sources: string[] };
@@ -46,6 +48,8 @@ export type HarnessResult = {
   claims: Claim[];
   citations: Record<string, Citation>;
   unsupported: Unsupported[];
+  outcome?: Outcome;
+  outcome_note?: string;
   steps: number;
   fix_rounds: number;
   context_chars: number;

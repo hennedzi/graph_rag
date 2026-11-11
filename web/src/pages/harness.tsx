@@ -9,9 +9,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { GraphView } from "@/components/graph-view";
-import { Claims, SourceBadge, Verdict } from "@/components/answer-card";
+import { Claims, OUTCOME_TITLE, SourceBadge, Verdict } from "@/components/answer-card";
 import { STATUS, toneClass, toolMeta } from "@/components/tools";
-import { fmtMs, fmtNum, getJson, streamHarness, type Edge, type HarnessEvent, type HarnessResult, type RunSummary } from "@/lib/api";
+import { fmtMs, fmtNum, getJson, postJson, streamHarness, type Edge, type HarnessEvent, type HarnessResult, type RunSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 export const EXAMPLES = [
@@ -48,12 +48,15 @@ type State = {
   turn: number;
   chars0: number; // контекст диалога до этого вопроса
   history?: boolean; // открыт из runs/: выводы инструментов там не хранятся
+  stopping?: boolean; // остановка запрошена, сервер дорабатывает текущий вызов модели
 };
 
 const initial: State = { query: "", running: false, budget: 32000, maxSteps: 8, chars: 0, ctx: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
 
-function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dialog: number } | { type: "abort" }): State {
+function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dialog: number } | { type: "abort" } | { type: "stopping" }): State {
   switch (e.type) {
+    case "stopping":
+      return { ...s, stopping: true };
     case "reset":
       return { ...initial, query: e.query, dialog: e.dialog, running: true, started: Date.now() };
     case "start":
@@ -280,7 +283,7 @@ function Answer({ s }: { s: State }) {
           {s.result && (
             <>
               <Claims claims={s.result.claims} answer={s.result.answer} citations={s.result.citations} />
-              <Verdict unsupported={s.result.unsupported} />
+              <Verdict unsupported={s.result.unsupported} outcome={s.result.outcome} note={s.result.outcome_note} />
               <div className="flex items-center gap-2 border-t pt-2.5">
               <p className="min-w-0 flex-1 font-mono text-[11px] text-muted-foreground">
                 {ROUTE_NOTE[s.result.route ?? ""] ? `${ROUTE_NOTE[s.result.route!]} · ` : `${s.result.steps} шагов · `}окно {fmtNum(s.result.context_tokens)} ток. · потрачено {fmtNum(s.result.tokens_spent)} ток.
@@ -435,11 +438,14 @@ const TAB = "h-7 gap-1 rounded-md px-0 text-xs data-[state=active]:bg-background
 const Count = ({ n }: { n?: number }) => (n ? <span className="font-mono text-[10.5px] text-muted-foreground">{n}</span> : null);
 
 function runStatus(s: State) {
+  if (s.stopping && s.running) return { icon: Loader2, t: "Останавливается: ждём текущий вызов модели", c: "text-muted-foreground", spin: true };
   if (s.running) return { icon: Loader2, t: "Агент идёт по базе знаний", c: "text-primary", spin: true };
   if (s.error) return { icon: XCircle, t: "Ошибка", c: "text-destructive" };
   if (s.result?.route === "chat") return { icon: MessagesSquare, t: "Реплика без поиска", c: "text-muted-foreground" };
   if (s.result?.unsupported.length) return { icon: ShieldAlert, t: "Есть неподтверждённое", c: "text-[hsl(var(--chart-5))]" };
-  return { icon: ShieldCheck, t: "Ответ подтверждён источниками", c: "text-primary" };
+  const o = s.result?.outcome;
+  if (o === "answered") return { icon: ShieldCheck, t: OUTCOME_TITLE.answered, c: "text-primary" };
+  return { icon: ShieldAlert, t: o ? OUTCOME_TITLE[o] ?? o : "Статус проверки не сохранён", c: "text-[hsl(var(--chart-5))]" };
 }
 
 // Шапка инспектора: что сейчас происходит и три счётчика — видны на любой вкладке.
@@ -547,7 +553,7 @@ function Inspector({ cur, v, tab, setTab, pick, sel }: { cur?: State; v?: Return
 }
 
 // ─── Боковая панель: вопросы диалога и история запусков ─────────
-type Ev = HarnessEvent | { type: "reset"; query: string } | { type: "abort" };
+type Ev = HarnessEvent | { type: "reset"; query: string } | { type: "abort" } | { type: "stopping" };
 type Chat = { turns: State[]; sel: number; session?: string; dialog: number };
 
 // Каждое событие стрима относится к последнему ходу; reset открывает новый ход в текущем диалоге.
@@ -567,8 +573,9 @@ function TurnIcon({ t }: { t: State }) {
   if (t.running) return <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />;
   if (t.error) return <XCircle className="h-3.5 w-3.5 text-destructive" />;
   if (t.result?.unsupported.length) return <ShieldAlert className="h-3.5 w-3.5 text-[hsl(var(--chart-5))]" />;
-  if (t.history) return <History className="h-3.5 w-3.5 text-muted-foreground" />;
-  return <ShieldCheck className="h-3.5 w-3.5 text-primary" />;
+  if (t.result?.outcome === "answered") return <ShieldCheck className="h-3.5 w-3.5 text-primary" />;
+  if (t.result?.outcome) return <ShieldAlert className="h-3.5 w-3.5 text-[hsl(var(--chart-5))]" />;
+  return <History className="h-3.5 w-3.5 text-muted-foreground" />;
 }
 
 function Sidebar({ c, onSelect, onNew, onLoad, busy }: { c: Chat; onSelect: (i: number) => void; onNew: () => void; onLoad: (id: string) => void; busy: boolean }) {
@@ -694,6 +701,13 @@ export default function HarnessPage() {
       qc.invalidateQueries({ queryKey: ["dashboard"] });
     }
   };
+  // Остановка на сервере: новых шагов не будет, придёт done с outcome=cancelled и накопленными материалами.
+  // Обрываем соединение, только если сервер запуска не знает (сессии ещё нет или 404).
+  const stop = () => {
+    if (!c.session) return abort.current?.abort();
+    dispatch({ type: "stopping" });
+    postJson("/harness/stop", { session_id: c.session }).catch(() => abort.current?.abort());
+  };
   const select = (i: number) => {
     dispatch({ type: "select", i });
     setPickKey(undefined);
@@ -730,7 +744,7 @@ export default function HarnessPage() {
           <Composer
             busy={running}
             onSend={run}
-            onStop={() => abort.current?.abort()}
+            onStop={stop}
             placeholder={c.session ? "Уточняющий вопрос — агент помнит прочитанное…" : "Задайте вопрос по базе знаний…"}
             examples={c.turns.length ? undefined : EXAMPLES}
             tools={

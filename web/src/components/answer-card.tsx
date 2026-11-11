@@ -1,7 +1,17 @@
 import { ShieldAlert, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
-import type { Citation, Claim, Unsupported } from "@/lib/api";
+import type { Citation, Claim, Outcome, Unsupported } from "@/lib/api";
+
+export const OUTCOME_TITLE: Record<Outcome, string> = {
+  answered: "Ответ подтверждён источниками",
+  partial: "Ответ частичный",
+  no_evidence: "В документах нет ответа",
+  verification_failed: "Проверка не выполнена",
+  budget_exceeded: "Достигнут лимит шагов",
+  cancelled: "Остановлено",
+  dependency_error: "Недоступна модель",
+};
 
 export function SourceBadge({ h, cite }: { h: string; cite?: Citation }) {
   return (
@@ -47,7 +57,18 @@ export function Claims({ claims, answer, citations }: { claims: Claim[]; answer:
   );
 }
 
-export function Verdict({ unsupported }: { unsupported: Unsupported[] }) {
+// Зелёный статус — только при outcome=answered с backend: пустой unsupported не доказывает, что проверка была.
+export function Verdict({ unsupported, outcome, note }: { unsupported: Unsupported[]; outcome?: Outcome; note?: string }) {
+  if (!unsupported.length && outcome !== "answered")
+    return (
+      <div className="flex items-start gap-2 rounded-md border border-[hsl(var(--chart-5)/0.35)] bg-[hsl(var(--chart-5)/0.1)] px-3 py-2 text-sm" data-testid={`status-${outcome ?? "unknown"}`}>
+        <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[hsl(var(--chart-5))]" />
+        <span>
+          <span className="font-medium text-[hsl(var(--chart-5))]">{outcome ? OUTCOME_TITLE[outcome] ?? outcome : "Статус проверки не сохранён"}</span>
+          <span className="text-muted-foreground"> — {note || (outcome ? "подробности в ходе работы" : "старый запуск, диагностика неполная")}</span>
+        </span>
+      </div>
+    );
   if (!unsupported.length)
     return (
       <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-sm text-primary" data-testid="status-verified">
