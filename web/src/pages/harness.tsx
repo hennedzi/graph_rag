@@ -708,6 +708,13 @@ export default function HarnessPage() {
     dispatch({ type: "stopping" });
     postJson("/harness/stop", { session_id: c.session }).catch(() => abort.current?.abort());
   };
+  // Остановка на сервере: новых шагов не будет, придёт done с outcome=cancelled и накопленными материалами.
+  // Обрываем соединение, только если сервер запуска не знает (сессии ещё нет или 404).
+  const stop = () => {
+    if (!c.session) return abort.current?.abort();
+    dispatch({ type: "stopping" });
+    postJson("/harness/stop", { session_id: c.session }).catch(() => abort.current?.abort());
+  };
   const select = (i: number) => {
     dispatch({ type: "select", i });
     setPickKey(undefined);
