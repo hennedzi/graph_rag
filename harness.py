@@ -835,6 +835,55 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
             name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
             say(sid, "→ %s %s", name, short(json.dumps(args, ensure_ascii=False)))
             await emit(st, "call", step=steps, id=c.id, tool=name, args=args, started_at=batch_start)
+
+        # ── C2: параллельный dispatch ──
+        # Модель генерирует все tool_calls в одном ходе ДО получения результатов, поэтому ни один вызов
+        # не может использовать результат другого — все независимы. Выполняем через asyncio.gather.
+        # answer — терминальный, обрабатываем отдельно и только после параллельных вызовов.
+        async def _tool(c):
+            name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
+            t0 = time.perf_counter()
+            edges_before = len(st["edges"])
+            status = "ok"
+            if ctx_now(st) > B:
+                out, status = "Бюджет окна исчерпан. Вызови answer по уже прочитанному.", "budget"
+            elif name not in IMPL:
+                out, status = f"нет инструмента {name}", "unknown_tool"
+            else:
+                try:
+                    with timeit(f"tool_{name}", st["timings"]):
+                        out = await IMPL[name](st, **args)
+                    TOOL_CALLS.labels(name, "ok").inc()
+                except TypeError as e:
+                    out, status = f"ошибка аргументов: {e}", "bad_args"
+                    TOOL_CALLS.labels(name, "bad_args").inc()
+                except (ValueError, MilvusException) as e:
+                    out, status = f"ошибка запроса: {getattr(e, 'message', None) or e}"[:600], "bad_query"
+                    TOOL_CALLS.labels(name, "bad_query").inc()
+            st["chars"] += len(out)
+            if (left := B - ctx_now(st) - len(out) // CHARS_PER_TOKEN) < B // 4:
+                out += f"\n(окно: осталось ~{max(left, 0)} из {B} токенов — пора отвечать)"
+            added = list(st["edges"].values())[edges_before:]
+            return c, out, status, round((time.perf_counter() - t0) * 1000, 1), added
+
+        tool_calls = [c for c in calls if c.function.name != "answer"]
+        ans_calls = [c for c in calls if c.function.name == "answer"]
+
+        if tool_calls:
+            for c, out, status, ms, added in await asyncio.gather(*[_tool(c) for c in tool_calls]):
+                say(sid, "← %s (%d симв.): %s", c.function.name, len(out), short(out))
+                await emit(st, "result", step=steps, id=c.id, tool=c.function.name, status=status, out=out[:3000],
+                           chars=len(out), ms=ms, total_chars=st["chars"],
+                           ctx_tokens=ctx_now(st) + len(out) // CHARS_PER_TOKEN,
+                           edges=added, started_at=batch_start)
+                st["trace"].append({"tool": c.function.name,
+                                    "args": core.parse_json(c.function.arguments or "{}", {}),
+                                    "chars": len(out)})
+                msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
+                st["pending"] += len(out)
+
+        for c in ans_calls:
+            name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
             t1, status, edges0 = batch_start, "ok", len(st["edges"])
             if name == "answer":
                 text, parsed, errors = render(st, args)
@@ -875,14 +924,14 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                     with timeit(f"tool_{name}", st["timings"]):
                         out = await IMPL[name](st, **args)
                     TOOL_CALLS.labels(name, "ok").inc()
-                except TypeError as e:  # модель передала не те аргументы — пусть исправится
+                except TypeError as e:
                     out, status = f"ошибка аргументов: {e}", "bad_args"
                     TOOL_CALLS.labels(name, "bad_args").inc()
-                except (ValueError, MilvusException) as e:  # плохой фильтр: текст ошибки — подсказка агенту
+                except (ValueError, MilvusException) as e:
                     out, status = f"ошибка запроса: {getattr(e, 'message', None) or e}"[:600], "bad_query"
                     TOOL_CALLS.labels(name, "bad_query").inc()
                 st["chars"] += len(out)
-                if (left := B - ctx_now(st) - len(out) // CHARS_PER_TOKEN) < B // 4:  # заранее, а не после
+                if (left := B - ctx_now(st) - len(out) // CHARS_PER_TOKEN) < B // 4:
                     out += f"\n(окно: осталось ~{max(left, 0)} из {B} токенов — пора отвечать)"
             say(sid, "← %s (%d симв.): %s", name, len(out), short(out))
             await emit(st, "result", step=steps, id=c.id, tool=name, status=status, out=out[:3000], chars=len(out),

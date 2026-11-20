@@ -1,4 +1,5 @@
 """Самопроверка чистой логики без моделей: uv run pytest -q test_core.py"""
+import time
 from pymilvus import DataType, MilvusClient
 
 import core
@@ -342,3 +343,74 @@ def test_event_duration_ms():
     asyncio.run(emit(st, "start", query="q"))
     assert st["events"][0]["duration_ms"] >= 0
     assert all("duration_ms" in e for e in st["events"])
+
+
+def test_parallel_dispatch(monkeypatch):
+    """C2: два независимых tool_call в одном ходу выполняются параллельно — одинаковый started_at."""
+    import asyncio
+    import harness
+    from types import SimpleNamespace as NS
+
+    def _ns(**kw):
+        n = NS(**kw)
+        n.model_dump = lambda: kw
+        return n
+
+    def _call(cid, name, args):
+        return NS(id=cid, function=NS(name=name, arguments=args), model_dump=lambda: {"id": cid, "function": {"name": name, "arguments": args}})
+
+    started = {}
+
+    async def fake_find(st, query, k=5):
+        started["find"] = time.monotonic()
+        await asyncio.sleep(0)  # дать шанс другому инструменту стартовать
+        return "сущность X"
+
+    async def fake_query(st, kind, filter="", query="", count=False, k=10):
+        started["db"] = time.monotonic()
+        await asyncio.sleep(0)
+        return "строки: 3"
+
+    monkeypatch.setitem(harness.IMPL, "find_entities", fake_find)
+    monkeypatch.setitem(harness.IMPL, "query_db", fake_query)
+    async def _noop_resolve(ses, query):
+        return query
+
+    async def _noop_budget():
+        return 32000
+
+    async def _noop_seed(st):
+        return ""
+
+    monkeypatch.setattr(harness, "resolve", _noop_resolve)
+    monkeypatch.setattr(harness, "budget", _noop_budget)
+    monkeypatch.setattr(harness, "seed_hint", _noop_seed)
+    monkeypatch.setattr(harness.core, "embed", lambda texts, *a, **k: [[0.0] * 1024 for _ in texts])
+
+    calls = [_call("c1", "find_entities", '{"query": "X"}'),
+             _call("c2", "query_db", '{"kind": "passage"}')]
+    msg = NS(content="", tool_calls=calls, model_extra={})
+    plain = NS(content="ответ", model_extra={}, tool_calls=[])
+
+    async def fake_chat(msgs, usage=None, **kw):
+        if not hasattr(fake_chat, "n"):
+            fake_chat.n = 0
+        fake_chat.n += 1
+        return msg if fake_chat.n == 1 else plain
+
+    async def _noop_verify(answer, sources):
+        return []
+
+    monkeypatch.setattr(harness.core, "chat", fake_chat)
+    monkeypatch.setattr(harness.core, "verify", _noop_verify)
+
+    st = harness.new_state("вопрос")
+    st["run_id"] = "r"
+    res = asyncio.run(harness.run("вопрос"))
+    results = [e for e in res["events"] if e["type"] == "result"]
+    started_at = {e["tool"]: e["started_at"] for e in results}
+    assert len(started_at) == 2, started_at
+    vals = list(started_at.values())
+    assert vals[0] == vals[1]  # один batch_start
+    assert "find" in started and "db" in started  # оба стартовали до конца другого
+    assert all(e["duration_ms"] >= 0 for e in results)
