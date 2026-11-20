@@ -829,12 +829,13 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
             unsupported = await check(st, answer)
             break
         done: set = set()
+        batch_start = time.perf_counter()
         for c in calls:
             done.add(c.id)
             name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
             say(sid, "→ %s %s", name, short(json.dumps(args, ensure_ascii=False)))
-            await emit(st, "call", step=steps, id=c.id, tool=name, args=args)
-            t1, status, edges0 = time.perf_counter(), "ok", len(st["edges"])
+            await emit(st, "call", step=steps, id=c.id, tool=name, args=args, started_at=batch_start)
+            t1, status, edges0 = batch_start, "ok", len(st["edges"])
             if name == "answer":
                 text, parsed, errors = render(st, args)
                 if errors:  # ловится кодом бесплатно, LLM-верификатор не зовём
@@ -887,7 +888,7 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
             await emit(st, "result", step=steps, id=c.id, tool=name, status=status, out=out[:3000], chars=len(out),
                        ms=round((time.perf_counter() - t1) * 1000, 1), total_chars=st["chars"],
                        ctx_tokens=ctx_now(st) + len(out) // CHARS_PER_TOKEN,
-                       edges=list(st["edges"].values())[edges0:])
+                       edges=list(st["edges"].values())[edges0:], started_at=batch_start)
             st["trace"].append({"tool": name, "args": args, "chars": len(out)})
             msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
             st["pending"] += len(out)
