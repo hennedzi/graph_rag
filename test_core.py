@@ -141,7 +141,7 @@ def test_emit_without_listener_is_noop():
         got.append(ev)
     st["emit"] = put
     asyncio.run(emit(st, "call", tool="neighbors"))
-    assert got == [{"seq": 2, "type": "call", "tool": "neighbors"}]  # живой UI и журнал получают одно и то же
+    assert got == [{"seq": 2, "type": "call", "tool": "neighbors", "duration_ms": 0}]  # живой UI и журнал получают одно и то же
 
 
 def test_run_summary(tmp_path):
@@ -332,3 +332,13 @@ def test_graph_part():
     out = graph_part(st, [{"text": "леонард эйлер"}], [rel])
     assert "сущности леонард эйлер" in out and "[P1]" in out and "r1" in st["edges"]  # ребро попало в граф UI
     assert graph_part(st, [], []) == ""
+
+
+def test_event_duration_ms():
+    import asyncio
+    from harness import new_state, emit
+    st = new_state("q")
+    st["run_id"] = "r"
+    asyncio.run(emit(st, "start", query="q"))
+    assert st["events"][0]["duration_ms"] >= 0
+    assert all("duration_ms" in e for e in st["events"])

@@ -563,6 +563,8 @@ def short(text, n: int = LOG_CHARS) -> str:
 async def emit(st, type: str, **ev):
     """Событие получает seq и попадает в журнал запуска (st["events"] → run JSON); живой UI получает то же самое."""
     st["seq"] += 1
+    if "duration_ms" not in ev:
+        ev["duration_ms"] = ev.get("ms", 0)
     ev = {"seq": st["seq"], "type": type, **ev}
     st["events"].append(ev)
     if st["emit"]:
