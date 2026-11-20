@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Switch, Route, Router, Link, useLocation } from "wouter";
 import { useHashLocation } from "wouter/use-hash-location";
 import { QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { Activity, Bot, FileUp, Moon, Network, Search, Sun } from "lucide-react";
+import { Activity, Bot, FileUp, Moon, Network, Sun } from "lucide-react";
 import { queryClient } from "./lib/queryClient";
 import { getJson, fmtNum, type Counts } from "./lib/api";
 import { Toaster } from "@/components/ui/toaster";
@@ -10,7 +10,6 @@ import { TooltipProvider, Tooltip, TooltipContent, TooltipTrigger } from "@/comp
 import { Logo } from "@/components/logo";
 import { StatusSlot, kbd } from "@/components/shell";
 import HarnessPage from "@/pages/harness";
-import SearchPage from "@/pages/search";
 import GraphPage from "@/pages/graph";
 import DocumentsPage from "@/pages/documents";
 import MetricsPage from "@/pages/metrics";
@@ -18,7 +17,6 @@ import { cn } from "@/lib/utils";
 
 const NAV = [
   { href: "/", label: "Harness — агент", icon: Bot },
-  { href: "/search", label: "Поиск и /ask", icon: Search },
   { href: "/graph", label: "Граф: PPR и пути", icon: Network },
   { href: "/documents", label: "Документы и ETL", icon: FileUp },
   { href: "/metrics", label: "Метрики", icon: Activity },
@@ -125,7 +123,6 @@ export default function App() {
                 <main className="min-w-0 flex-1">
                   <Switch>
                     <Route path="/" component={HarnessPage} />
-                    <Route path="/search" component={SearchPage} />
                     <Route path="/graph" component={GraphPage} />
                     <Route path="/documents" component={DocumentsPage} />
                     <Route path="/metrics">

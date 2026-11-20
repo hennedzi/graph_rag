@@ -49,9 +49,10 @@ GraphRAG harness: агент с гибридным поиском (Milvus: dense
 FastAPI-бэкенд и веб-интерфейс на React. Детали задач — в `FUTURE.md` и `docs/tasks/`.
 
 ## Команды
-- Тесты ядра: `uv run pytest -q test_core.py`
+- Тесты: `uv run pytest -q test_core.py test_cli.py`
 - Фронтенд: `cd web && npm install && npm run build`
-- Сервер: `uvicorn api:app --reload`
+- Сервер: `uv run uvicorn api:app --port 8200`
+- Терминальный клиент: `uv run cli.py` (TUI), `uv run cli.py --no-tui` (REPL), `uv run cli.py "вопрос"`
 
 ## Правила
 - Одна задача из `FUTURE.md` = один коммит, формат `<ID>: описание` (например, `C1: sse events`).

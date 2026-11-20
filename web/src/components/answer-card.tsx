@@ -17,7 +17,11 @@ export function SourceBadge({ h, cite }: { h: string; cite?: Citation }) {
   return (
     <HoverCard openDelay={80} closeDelay={60}>
       <HoverCardTrigger asChild>
-        <button type="button" data-testid={`badge-source-${h}`}>
+        <button
+          type="button"
+          data-testid={`badge-source-${h}`}
+          aria-label={`Источник ${h}${cite?.doc ? `, документ ${cite.doc}` : ""}`}
+        >
           <Badge variant="outline" className="cursor-help border-primary/40 font-mono text-[11px] text-primary">
             {h}
           </Badge>
@@ -40,7 +44,7 @@ export function Claims({ claims, answer, citations }: { claims: Claim[]; answer:
     <ol className="space-y-3">
       {claims.map((c, i) => (
         <li key={i} className="flex gap-3" data-testid={`claim-${i}`}>
-          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/15 font-mono text-[11px] text-primary">
+          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/15 font-mono text-[11px] text-primary" aria-hidden="true">
             {i + 1}
           </span>
           <div className="space-y-1.5">

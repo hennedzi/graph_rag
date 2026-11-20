@@ -6,26 +6,29 @@
 > обнови статус в таблице `FUTURE.md` и сделай коммит `git commit -m "{commit}: ..."`.
 
 
-- **Статус:** не начат
+- **Статус:** готово
 - **Приоритет:** P0
 - **Зависит от:** —
 - **Разблокирует:** все задачи этапа C и D
 
 ## Цель
-Незакоммиченные изменения `api.py`, `core.py`, `harness.py`, `test_core.py` (с 7.11.2026) попадают в git отдельным коммитом. Без этого любая следующая задача мешается с чужими изменениями.
+Незакоммиченные изменения `api.py`, `core.py`, `harness.py`, `test_core.py`, конфига, веба,
+а также накопленная работа этапа C, новый клиент `cli.py` и обновлённые документы попадают в git
+одним коммитом. Без этого любая следующая задача мешается с чужими изменениями.
 
 ## Что сделать
 1. Перейди в корень проекта: `cd /Users/hena/Projects/graph_rag`.
 2. Посмотри состояние: `git status --short` и `git diff --stat`.
-3. Прогони тесты: `uv run pytest -q test_core.py`. Если падают — остановись и сообщи, ничего не коммить.
+3. Прогони тесты: `uv run pytest -q test_core.py test_cli.py`. Если падают — остановись и сообщи, ничего не коммить.
 4. Собери фронтенд: `cd web && npm run build`, затем вернись в корень.
-5. `git add api.py core.py harness.py test_core.py web/src` и `git commit -m "T0: commit pending harness and api work"`.
+5. `git add api.py core.py harness.py test_core.py test_cli.py cli.py config.example.ini eval/questions.jsonl web FUTURE.md README.md AGENTS.md docs`
+   и `git commit -m "T0: commit pending work, CLI client and docs"`.
 
 ## Границы задачи
 - Не исправляй упавшие тесты «на ходу» — это отдельная работа.
-- Не коммить `runs/`, кэши, `.env`, `node_modules`.
+- Не коммить `runs/`, кэши, `.env`, `node_modules`, `config.ini`.
 
 ## Критерии готовности
-- [ ] `git status` чистый для этих четырёх файлов.
-- [ ] Коммит содержит только перечисленные файлы.
+- [x] `git status` чистый для перечисленных файлов.
+- [x] Коммит содержит накопленную работу, клиент и документы.
 

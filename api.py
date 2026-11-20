@@ -133,6 +133,7 @@ async def ask(q: Query):
 
 @app.post("/harness")
 async def ask_harness(q: HarnessQuery):
+    asyncio.create_task(core.prefetch(q.query))  # C3: поиск в фоне, пока модель думает
     r = await harness.run(q.query, session_id=q.session_id, doc=q.doc)
     REQUESTS.labels("harness", r.get("outcome") or "answered").inc()
     return r
@@ -153,6 +154,7 @@ async def harness_stream(q: HarnessQuery):
     events: asyncio.Queue = asyncio.Queue()
 
     async def work():
+        asyncio.create_task(core.prefetch(q.query))
         try:
             r = await harness.run(q.query, on_event=events.put, session_id=q.session_id, doc=q.doc)
             REQUESTS.labels("harness", r.get("outcome") or "answered").inc()

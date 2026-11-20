@@ -314,8 +314,10 @@ def test_reply_guard():
     from harness import new_state, render
     st = new_state("Кто учитель Эйлера?")
     assert render(st, {"reply": "Иоганн Бернулли"})[2]  # вопрос к базе: reply без источников нельзя
+    assert render(st, {"reply": "Иоганн Бернулли", "no_answer": True})[0].startswith("В предоставленном контексте нет")
     st = new_state("Я студент")
     assert render(st, {"reply": "Хорошо, спрашивайте."}) == ("Хорошо, спрашивайте.", [], [])
+    assert render(st, {"reply": "Очень короткий ответ выходит", "no_answer": True}) == ("Очень короткий ответ выходит", [], [])
     assert render(st, {"reply": "Эйлер родился в Базеле [P1]"})[2]
 
 
@@ -414,3 +416,193 @@ def test_parallel_dispatch(monkeypatch):
     assert vals[0] == vals[1]  # один batch_start
     assert "find" in started and "db" in started  # оба стартовали до конца другого
     assert all(e["duration_ms"] >= 0 for e in results)
+
+
+def test_prefetch_ttl(monkeypatch):
+    """C3: префетч одноразовый и живёт ровно cache_ttl."""
+    import asyncio
+
+    async def fake_retrieve(query, timings, top_n=10, min_score=None):
+        return [], [], [{"id": "p1", "doc": "d", "text": "t", "score": 0.9}]
+    monkeypatch.setattr(core, "retrieve", fake_retrieve)
+    core._PREFETCH.clear()
+    asyncio.run(core.prefetch("q"))
+    assert core.prefetch_get("q") is not None
+    assert core.prefetch_get("q") is None  # второе чтение — промах
+    core._PREFETCH["q"] = (time.time() - core._ttl() - 1, [], [], [])
+    assert core.prefetch_get("q") is None  # TTL истёк
+
+
+def test_speculative_search_hit(monkeypatch):
+    """C3: попадание в префетч помечено speculative и не вызывает retrieve."""
+    import asyncio
+    import harness
+
+    calls = []
+
+    async def fake_retrieve(query, timings, top_n=10, min_score=None):
+        calls.append(query)
+        return [], [], [{"id": "p1", "doc": "d", "text": "t", "score": 0.9}]
+
+    monkeypatch.setattr(core, "retrieve", fake_retrieve)
+    core._PREFETCH.clear()
+    asyncio.run(core.prefetch("q"))
+    calls.clear()
+    st = harness.new_state("q")
+    asyncio.run(harness.search_passages(st, "q"))
+    assert calls == []  # search_passages не ходил в поиск — взяли из префетча
+    assert st["last_speculative"] is True and st["last_search_top"] == 0.9
+
+
+def test_fast_path_streams_answer(monkeypatch):
+    """C4+C5: уверенный реранкер — один стриминговый вызов, токены идут в ленту до answer_finished."""
+    import asyncio
+    import harness
+    from types import SimpleNamespace as NS
+
+    def _call(cid, name, args):
+        return NS(id=cid, content="", function=NS(name=name, arguments=args),
+                  model_dump=lambda: {"id": cid, "function": {"name": name, "arguments": args}})
+
+    async def fake_search(st, query, k=3):
+        st["last_search_top"] = 0.93
+        st["pid"]["P1"], st["text"]["p1"], st["doc"]["p1"] = "p1", "текст один", "doc"
+        st["pid"]["P2"], st["text"]["p2"], st["doc"]["p2"] = "p2", "текст два", "doc"
+        return "пассаж про X"
+
+    monkeypatch.setitem(harness.IMPL, "search_passages", fake_search)
+
+    async def _noop_resolve(ses, query):
+        return query
+
+    async def _noop_budget():
+        return 32000
+
+    async def _noop_seed(st):
+        return ""
+
+    monkeypatch.setattr(harness, "resolve", _noop_resolve)
+    monkeypatch.setattr(harness, "budget", _noop_budget)
+    monkeypatch.setattr(harness, "seed_hint", _noop_seed)
+    monkeypatch.setattr(harness.core, "embed", lambda texts, *a, **k: [[0.0] * 1024 for _ in texts])
+
+    search = NS(content="", model_extra={}, tool_calls=[_call("s1", "search_passages", '{"query": "X"}')])
+    chat_calls = [search]
+
+    async def fake_chat(msgs, usage=None, **kw):
+        return chat_calls.pop(0)
+
+    chunks = ["Факт один [P1]\n", "Факт два [P2]"]
+
+    async def fake_stream(msgs, on_token, usage=None, **kw):
+        for ch in chunks:
+            await on_token(ch)
+        return "".join(chunks)
+
+    async def _noop_verify(text, sources):
+        return []
+
+    async def _no_off(st, claims):
+        return []
+
+    monkeypatch.setattr(harness.core, "chat", fake_chat)
+    monkeypatch.setattr(harness.core, "chat_stream", fake_stream)
+    monkeypatch.setattr(harness.core, "verify", _noop_verify)
+    monkeypatch.setattr(harness, "off_topic", _no_off)
+
+    res = asyncio.run(harness.run("вопрос"))
+    ev = res["events"]
+    assert any(e["type"] == "fast_path_taken" for e in ev)
+    tokens = [e for e in ev if e["type"] == "token"]
+    assert len(tokens) >= 2
+    finish_i = next(i for i, e in enumerate(ev) if e["type"] == "answer_finished")
+    assert all(i < finish_i for i, e in enumerate(ev) if e["type"] == "token")
+    assert set(ev[finish_i]["citations"]) == {"P1", "P2"}
+    assert chat_calls == []  # один вызов: поиск; ответ пришёл стримом
+    assert "Факт один [P1]" in res["answer"] and "Факт два [P2]" in res["answer"]
+
+
+def test_chat_stream_emits_chunks(monkeypatch):
+    """C5: провайдер стримит чанки в on_token и возвращает полный текст + usage."""
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    class Chunk:
+        def __init__(self, text=None, usage=None):
+            self.choices = [NS(delta=NS(content=text))] if text is not None else []
+            self.usage = usage
+
+    class Completions:
+        async def create(self, **kw):
+            async def gen():
+                yield Chunk("раз")
+                yield Chunk("два")
+                yield Chunk(usage=NS(prompt_tokens=3, completion_tokens=2))
+            return gen()
+
+    monkeypatch.setattr(core, "llm", NS(chat=NS(completions=Completions())))
+    got, usage = [], {}
+
+    async def on_token(t):
+        got.append(t)
+
+    text = asyncio.run(core.chat_stream([{"role": "user", "content": "q"}], on_token, usage=usage))
+    assert text == "раздва" and got == ["раз", "два"]
+    assert usage == {"prompt": 3, "completion": 2}
+
+
+def test_plain_text_answer_is_parsed_and_verified(monkeypatch):
+    """Текст без answer-инструмента — тоже ответ: факты с [P#], markdown вычищается, статус answered."""
+    import asyncio
+    import harness
+    from types import SimpleNamespace as NS
+
+    def _call(cid, name, args):
+        return NS(id=cid, content="", function=NS(name=name, arguments=args),
+                  model_dump=lambda: {"id": cid, "function": {"name": name, "arguments": args}})
+
+    async def fake_find(st, query, k=5):
+        st["pid"]["P1"], st["text"]["p1"], st["doc"]["p1"] = "p1", "Иоганн Бернулли — учитель Эйлера.", "doc"
+        st["pid"]["P2"], st["text"]["p2"], st["doc"]["p2"] = "p2", "Эйлер работал в Петербурге.", "doc"
+        return "иоганн бернулли"
+
+    monkeypatch.setitem(harness.IMPL, "find_entities", fake_find)
+
+    async def _noop_resolve(ses, query):
+        return query
+
+    async def _noop_budget():
+        return 32000
+
+    async def _noop_seed(st):
+        return ""
+
+    monkeypatch.setattr(harness, "resolve", _noop_resolve)
+    monkeypatch.setattr(harness, "budget", _noop_budget)
+    monkeypatch.setattr(harness, "seed_hint", _noop_seed)
+
+    text = ("1. **Прямая связь**: Иоганн Бернулли был учителем Леонарда Эйлера [P1].\n"
+            "2. **Ещё факт**: Эйлер работал в Петербурге [P2].")
+    calls = [NS(content="", model_extra={}, tool_calls=[_call("f1", "find_entities", '{"query": "x"}')]),
+             NS(content=text, model_extra={}, tool_calls=[])]
+
+    async def fake_chat(msgs, usage=None, **kw):
+        return calls.pop(0)
+
+    async def _noop_verify(text, sources):
+        return []
+
+    async def _no_off(st, claims):
+        return []
+
+    monkeypatch.setattr(harness.core, "chat", fake_chat)
+    monkeypatch.setattr(harness.core, "verify", _noop_verify)
+    monkeypatch.setattr(harness, "off_topic", _no_off)
+
+    res = asyncio.run(harness.run("вопрос"))
+    assert res["outcome"] == "answered"
+    ev = res["events"]
+    assert sum(e["type"] == "token" for e in ev) >= 2  # C5: текст и в стриме
+    assert "**" not in res["answer"] and "[" not in res["answer"].replace("[P", "")
+    assert "Иоганн Бернулли был учителем Леонарда Эйлера. [P1]" in res["answer"]
+    assert len(res["claims"]) == 2

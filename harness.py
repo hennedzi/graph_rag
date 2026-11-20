@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from types import SimpleNamespace
 
 import openai
 from prometheus_client import Counter, Histogram
@@ -40,6 +41,8 @@ MAX_STEPS = cfg.getint("harness", "max_steps")
 # Бюджет — реальные токены окна LLM (usage.prompt_tokens от llama.cpp), а не символы ответов инструментов:
 # в окно входят системный промпт, схемы инструментов и вся история диалога. Держите ≤ n_ctx llama-server (-c).
 BUDGET = cfg.getint("harness", "budget_tokens", fallback=32000)
+# C4: если после первого поиска топ-скор реранкера выше порога — модель отвечает сразу, без графа и без второго круга.
+FAST_PATH_THRESHOLD = cfg.getfloat("harness", "fast_path_threshold", fallback=0.8)
 CHARS_PER_TOKEN = 3  # shortcut: оценка только для текста, добавленного после последнего вызова LLM; точное число — в следующем usage
 PREVIEW = cfg.getint("harness", "preview_chars")
 FIX_ROUNDS = cfg.getint("harness", "fix_rounds")
@@ -94,7 +97,10 @@ SYSTEM = f"""Ты — исследователь базы знаний (граф
 - не объединяй факты о разных людях; отвечай только про того, о ком спросили, и только на вопрос;
 - каждое утверждение должно отвечать именно на вопрос; верные, но посторонние факты, найденные попутно
   (интерфейс, порты, команды — когда спрашивали не про них), не включай: проверка их отбросит;
-- если в прочитанном нет ответа на САМ вопрос — answer с no_answer=true, даже если нашлось что-то по соседней теме."""
+- если в прочитанном нет ответа на САМ вопрос — answer с no_answer=true, даже если нашлось что-то по соседней теме.
+- отвечай развёрнуто, 3–6 предложений по существу, а не одним фактом: объясняй «почему/как», добавляй
+  относящиеся к вопросу детали и контекст из прочитанных пассажей; не своди ответ к минимуму и не выбрасывай
+  относящиеся к вопросу факты ради краткости. Если фактов в прочитанном мало — ответь коротко, не выдумывай."""
 
 
 def _fn(name, desc, props, required):
@@ -305,9 +311,16 @@ async def search_passages(st, query: str, k: int = 3) -> str:
     Порог реранкера подобран на биографиях; на технических текстах (README, таблицы, код) честные совпадения
     часто ниже него. Агенту лучше увидеть 3 слабых превью с пометкой, чем «ничего» и поиск по кругу.
     """
-    ents, rels, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10), min_score=float("-inf"))
+    hit = core.prefetch_get(query)
+    if hit:  # C3: результат уже посчитан в фоне, поиск не ждём
+        ents, rels, ps = hit
+        st["last_speculative"] = True
+    else:
+        ents, rels, ps = await core.retrieve(query, st["timings"], top_n=min(k, 10), min_score=float("-inf"))
+        st["last_speculative"] = False
     if st.get("scope"):  # область поиска: пассажи только из выбранного документа
         ps = [p for p in ps if p["doc"] == st["scope"]]
+    st["last_search_top"] = max((p.get("score", 0.0) for p in ps), default=0.0)
     head = graph_part(st, ents, rels)
     if st.get("scope"):
         head = f"(область: пассажи только из {st['scope']}; граф и сущности — по всей базе)\n" + head
@@ -411,15 +424,18 @@ def render(st, args: dict) -> tuple[str, list[dict], list[str]]:
     claims → текст «факт [P1] [P3]» + детерминированные ошибки (без LLM): факт без источника,
     неизвестный хэндл. Старый формат {"text": ...} тоже принимаем — модель может проигнорировать схему.
     """
-    if args.get("no_answer"):
-        return core.NO_CONTEXT, [], []
     if (reply := str(args.get("reply") or "").strip()) and not args.get("claims"):
         # reply не верифицируется, поэтому пускаем его только на не-вопрос и без ссылок/длинных фактов
         if is_question(st["query"]):
+            # вопрос к базе, но модель явно сказала «ответа нет» — это честный no_answer, а не реплика
+            if args.get("no_answer"):
+                return core.NO_CONTEXT, [], []
             return reply, [], ["это вопрос к базе: reply нельзя — найди пассажи и дай claims или no_answer=true"]
         if "[P" in reply or len(reply) > 300:
             return reply, [], ["reply — короткая реплика без фактов и ссылок; факты — только через claims"]
         return reply, [], []
+    if args.get("no_answer"):
+        return core.NO_CONTEXT, [], []
     if not isinstance(args.get("claims"), list):
         text = str(args.get("text", "")).strip()
         return text, [], [] if text else ["пустой ответ: передай claims"]
@@ -527,7 +543,9 @@ RESOLVE_PROMPT = """Перепиши реплику пользователя в 
 - реплика уточняет предмет («я про X», «имею в виду X») — перепиши ПОСЛЕДНИЙ вопрос с этим предметом
   (например, «что ещё умеет приложение?» + «я про Graph RAG» → «что ещё умеет приложение Graph RAG?»);
 - реплика без вопроса (спасибо, оценка, «теперь лучше», согласие) — верни её дословно;
-- реплика уже самостоятельный вопрос — верни её без изменений.
+- реплика уже самостоятельный вопрос — верни её без изменений;
+- реплика про сам сервис, интерфейс, код или сервер («что тут не так?», «почему не работает поиск?», «это баг?») —
+  верни её дословно: в документах ответа на неё нет.
 Верни только вопрос одной строкой, без пояснений."""
 
 
@@ -650,9 +668,12 @@ def ctx_now(st) -> int:
     return st["ctx"] + st["pending"] // CHARS_PER_TOKEN
 
 
-async def llm_step(st, msgs: list[dict], tools: bool = True):
+async def llm_step(st, msgs: list[dict], tools: bool = True, on_token=None):
     u: dict = {}
-    msg = await (chat_tools(msgs, u) if tools else core.chat(msgs, usage=u))
+    if on_token is not None:  # C5: финальный ответ стримим, инструменты на этом шаге не нужны
+        msg = SimpleNamespace(content=await core.chat_stream(msgs, on_token, usage=u), tool_calls=[])
+    else:
+        msg = await (chat_tools(msgs, u) if tools else core.chat(msgs, usage=u))
     if u:
         st["ctx"], st["pending"] = u["prompt"], 0
         st["spent"] += u["prompt"] + u["completion"]
@@ -762,6 +783,9 @@ def outcome_of(answer: str, claims: list[dict], unsupported: list, cancelled: bo
     if verify_error:
         return "verification_failed", "проверяющая модель не ответила — опора на источники не проверена"
     if not claims:
+        if answer and not answer.startswith(core.NO_CONTEXT[:30]):
+            # модель ответила текстом без ссылок [P#]: отвечать «нет ответа» было бы ложью
+            return "verification_failed", "ответ без ссылок на источники — проверка не выполнена"
         return ("budget_exceeded", "достигнут лимит шагов — ответа не нашлось") if steps_exhausted \
             else ("no_evidence", "в прочитанных документах нет ответа на вопрос")
     if unsupported:
@@ -783,9 +807,40 @@ async def run(query: str, on_event=None, session_id: str | None = None, doc: str
         ses.update(busy=False, used=time.monotonic())
 
 
+def citations(st, answer: str) -> dict:
+    return {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
+                "text": st["text"].get(st["pid"][h], "")} for h in st["pid"] if f"[{h}]" in answer}
+
+
+async def emit_answer(st, answer: str, cited: dict):
+    """C5: если ответ пришёл инструментом answer (без стрима), отдаём текст чанками — UI печатает его постепенно."""
+    if not st.get("streamed"):
+        chunks = [answer[i:i + 24] for i in range(0, len(answer), 24)]
+        nap = min(0.012, 0.5 / max(1, len(chunks)))  # длинный ответ печатаем не дольше ~0.5 с
+        for ch in chunks:
+            await emit(st, "token", text=ch)
+            await asyncio.sleep(nap)
+    await emit(st, "answer_finished", text=answer, citations=cited)
+
+
+async def final_text(st, msgs: list[dict], instruction: str) -> tuple[str, list[dict], list[dict]]:
+    """C5: финальный ответ текстом с [P#] — токены стримим в ленту, затем проверяем как answer."""
+    msgs.append({"role": "user", "content": instruction})
+    st["streamed"] = True  # этот ответ уже ушёл токенами — повторно чанковать не нужно
+    raw = core.strip_think((await llm_step(st, msgs, tools=False, on_token=lambda t: emit(st, "token", text=t))).content)
+    msgs.append({"role": "assistant", "content": raw})
+    claims = lines_to_claims(st, raw)
+    with timeit("harness_verify", st["timings"]):
+        unsupported, off = await asyncio.gather(check(st, fmt(claims)), off_topic(st, claims))
+    OFF_TOPIC.inc(len(off))
+    claims = [c for c in claims if c not in off]
+    return fmt(claims) or core.NO_CONTEXT, claims, unsupported if claims else []
+
+
 async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     st, msgs, t0, sid = ses["st"], ses["msgs"], time.perf_counter(), session_id[:6]
     st["sid"] = sid
+    st["streamed"] = False  # на каждый вопрос свой стрим: не наследуем флаг прошлого хода
     with timeit("harness_resolve", st["timings"]):
         st["query"] = await resolve(ses, query)
     if normalize(st["query"]) != normalize(query):
@@ -824,9 +879,18 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
             say(sid, "шаг %d, пишет: %s", steps, short(said))
         msgs.append({"role": "assistant", "content": msg.content or "",
                      **({"tool_calls": [c.model_dump() for c in calls]} if calls else {})})
-        if not calls:  # модель ответила текстом без инструмента — считаем это ответом
+        if not calls:  # модель ответила текстом: разбираем на факты и проверяем, как answer
             answer = core.strip_think(msg.content)
-            unsupported = await check(st, answer)
+            claims = lines_to_claims(st, answer)
+            if claims:
+                with timeit("harness_verify", st["timings"]):
+                    unsupported, off = await asyncio.gather(check(st, fmt(claims)), off_topic(st, claims))
+                OFF_TOPIC.inc(len(off))
+                claims = [c for c in claims if c not in off]
+                answer = fmt(claims) or core.NO_CONTEXT
+                unsupported = unsupported if claims else []
+            else:  # короткая реплика без фактов — проверять нечего
+                unsupported = await check(st, answer)
             break
         done: set = set()
         batch_start = time.perf_counter()
@@ -875,12 +939,24 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
                 await emit(st, "result", step=steps, id=c.id, tool=c.function.name, status=status, out=out[:3000],
                            chars=len(out), ms=ms, total_chars=st["chars"],
                            ctx_tokens=ctx_now(st) + len(out) // CHARS_PER_TOKEN,
-                           edges=added, started_at=batch_start)
+                           edges=added, speculative=st.get("last_speculative", False) if c.function.name == "search_passages" else False, started_at=batch_start)
                 st["trace"].append({"tool": c.function.name,
                                     "args": core.parse_json(c.function.arguments or "{}", {}),
                                     "chars": len(out)})
                 msgs.append({"role": "tool", "tool_call_id": c.id, "content": out})
                 st["pending"] += len(out)
+
+        if (not ans_calls and tool_calls and not st.get("fast_path_used")
+                and any(c.function.name == "search_passages" for c in tool_calls)
+                and st.get("last_search_top", 0.0) >= FAST_PATH_THRESHOLD):
+            # C4+C5: реранкер уверен — один стриминговый вызов модели, без графа и второго круга.
+            st["fast_path_used"] = True
+            await emit(st, "fast_path_taken", top_score=st["last_search_top"])
+            answer, claims, unsupported = await final_text(
+                st, msgs, "Быстрый путь: реранкер уверен. Ответь на вопрос по прочитанным пассажам: "
+                          "один факт в строке, в конце строки ссылки [P#], без markdown. "
+                          f"Если ответа на этот вопрос в прочитанном нет — ответь: {core.NO_CONTEXT}")
+            break
 
         for c in ans_calls:
             name, args = c.function.name, core.parse_json(c.function.arguments or "{}", {})
@@ -947,19 +1023,11 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
 
     if answer is None and st["cancel"]:
         answer = "Запуск остановлен на шаге {0}. Прочитанные материалы и подграф — в инспекторе.".format(steps)
-    elif answer is None:  # шаги кончились — просим ответ без инструментов, но проверяем так же, как answer
-        msgs.append({"role": "user", "content": f"Шаги закончились. Ответь на вопрос «{st['query']}» по прочитанным "
-                     "пассажам: один факт в строке, в конце строки ссылки [P#], без markdown. "
-                     f"Если ответа на этот вопрос в прочитанном нет — ответь: {core.NO_CONTEXT}"})
-        raw = core.strip_think((await llm_step(st, msgs, tools=False)).content)
-        msgs.append({"role": "assistant", "content": raw})
-        claims = lines_to_claims(st, raw)
-        with timeit("harness_verify", st["timings"]):
-            unsupported, off = await asyncio.gather(check(st, fmt(claims)), off_topic(st, claims))
-        OFF_TOPIC.inc(len(off))
-        claims = [c for c in claims if c not in off]
-        answer = fmt(claims) or core.NO_CONTEXT
-        unsupported = unsupported if claims else []
+    elif answer is None:  # шаги кончились — просим ответ без инструментов, проверяем так же, как answer
+        answer, claims, unsupported = await final_text(
+            st, msgs, f"Шаги закончились. Ответь на вопрос «{st['query']}» по прочитанным пассажам: "
+                       "один факт в строке, в конце строки ссылки [P#], без markdown. "
+                       f"Если ответа на этот вопрос в прочитанном нет — ответь: {core.NO_CONTEXT}")
     outcome, note = outcome_of(answer, claims, unsupported, st["cancel"], steps >= MAX_STEPS, st["verify_error"])
     OUTCOME.labels(outcome).inc()
 
@@ -975,11 +1043,13 @@ async def _run(query: str, on_event, session_id: str, ses: dict) -> dict:
     CONTEXT_TOKENS.observe(ctx_now(st))
     SPENT_TOKENS.observe(st["spent"])
     UNSUPPORTED.inc(len(unsupported))
+    await emit_answer(st, answer, citations(st, answer))
     return finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, "agent", outcome, note)
 
 
 async def _quick(query: str, kind: str, on_event, session_id: str, ses: dict) -> dict:
     st, t0, chars0 = ses["st"], time.perf_counter(), ses["st"]["chars"]
+    st["streamed"] = False
     st["budget"], st["emit"] = await budget(), on_event
     await emit(st, "start", query=query, budget=st["budget"], max_steps=0, session_id=session_id, route=kind,
                turn=ses["turns"], chars=st["chars"], ctx_tokens=ctx_now(st), edges=list(st["edges"].values()),
@@ -992,14 +1062,14 @@ async def _quick(query: str, kind: str, on_event, session_id: str, ses: dict) ->
             "rewrite_fallback": "пересказ не прошёл проверку — показан прошлый проверенный ответ"}.get(kind, "")
     OUTCOME.labels(outcome).inc()
     say(session_id[:6], "без поиска (%s): %s", kind, short(answer))
+    await emit_answer(st, answer, citations(st, answer))
     return finish(st, ses, session_id, query, answer, [], unsupported, 0, 0, chars0, t0, kind, outcome, note)
 
 
 def finish(st, ses, session_id, query, answer, claims, unsupported, steps, fixes, chars0, t0, kind, outcome, note) -> dict:
     B = st["budget"]
     st["timings"]["total"] = round((time.perf_counter() - t0) * 1000, 1)
-    cited = {h: {"doc_id": st["pid"][h], "doc": st["doc"].get(st["pid"][h], ""),
-                 "text": st["text"].get(st["pid"][h], "")} for h in st["pid"] if f"[{h}]" in answer}
+    cited = citations(st, answer)
     result = {"query": query, "question": st["query"], "answer": answer, "claims": claims, "citations": cited, "unsupported": unsupported,
               "steps": steps, "fix_rounds": fixes, "context_chars": st["chars"], "turn_chars": st["chars"] - chars0, "trace": st["trace"], "thoughts": st["thoughts"],
               "graph": list(st["edges"].values()), "session_id": session_id, "turn": ses["turns"],

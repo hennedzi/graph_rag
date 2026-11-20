@@ -11,6 +11,7 @@ id = хэш содержимого → повторная загрузка то�
 import configparser
 import hashlib
 import json
+import openai
 import logging
 import os
 import re
@@ -33,6 +34,7 @@ if not cfg.read(os.environ.get("RAG_CONFIG", "config.ini"), encoding="utf-8"):
     raise SystemExit("Нет config.ini: cp config.example.ini config.ini и впишите api_key")
 
 LLM_MODEL = cfg["llm"]["model"]
+LLM_TEMPERATURE = cfg.getfloat("llm", "temperature", fallback=0.0)
 EMB_MODEL, EMB_DIM = cfg["embeddings"]["model"], cfg.getint("embeddings", "dimension")
 EMB_BATCH = cfg.getint("embeddings", "batch", fallback=64)
 RERANK_MODEL = cfg["reranker"]["model"]
@@ -130,6 +132,25 @@ reranker = AsyncOpenAI(base_url=cfg["reranker"]["url"].rstrip("/"), api_key="not
 
 
 _CACHE: dict = {}
+_PREFETCH: dict = {}
+
+
+async def prefetch(query: str):
+    """C3: считаем эмбеддинг и гибридный поиск до первого вызова LLM; результат читает search_passages."""
+    try:
+        ents, rels, ps = await retrieve(query, {}, top_n=TOP_PASSAGES, min_score=float("-inf"))
+        _PREFETCH[query] = (time.time(), ents, rels, ps)
+    except Exception:
+        pass
+
+
+def prefetch_get(query: str):
+    v = _PREFETCH.pop(query, None)
+    if v is None or time.time() - v[0] > _ttl():
+        return None
+    return v[1], v[2], v[3]
+
+
 def _ttl() -> int:
     return int(cfg.get("core", "cache_ttl", fallback="300")) if cfg.has_section("core") else 300
 
@@ -146,6 +167,7 @@ def _cache_set(key, val):
     _CACHE[key] = (time.time(), val)
 
 def invalidate_cache(scope=None):
+    _PREFETCH.clear()
     if scope is None:
         _CACHE.clear()
     else:
@@ -171,8 +193,22 @@ async def embed(texts: list[str]) -> list[list[float]]:
 
 
 async def chat(messages: list[dict], usage: dict | None = None, **kw):
-    """usage — необязательный dict, куда кладём prompt/completion токены этого вызова (для бюджета harness)."""
-    r = await llm.chat.completions.create(model=LLM_MODEL, messages=messages, temperature=0.0, **kw)
+    """usage — необязательный dict, куда кладём prompt/completion токенов этого вызова (для бюджета harness)."""
+    kw.setdefault("temperature", LLM_TEMPERATURE)
+    try:
+        r = await llm.chat.completions.create(model=LLM_MODEL, messages=messages, **kw)
+    except openai.BadRequestError as e:
+        if "Cannot continue an assistant message that contains tool calls" not in str(e):
+            raise
+        sanitized = []
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                sanitized.append({"role": "assistant", "content": m.get("content") or ""})
+            elif m.get("role") == "tool":
+                sanitized.append({"role": "user", "content": f"[tool result] {m.get('content','')}"})
+            else:
+                sanitized.append(m)
+        r = await llm.chat.completions.create(model=LLM_MODEL, messages=sanitized, **kw)
     if r.usage:
         LLM_TOKENS.labels("prompt").inc(r.usage.prompt_tokens)
         LLM_TOKENS.labels("completion").inc(r.usage.completion_tokens)
@@ -182,7 +218,29 @@ async def chat(messages: list[dict], usage: dict | None = None, **kw):
 
 
 async def ask_llm(prompt: str) -> str:
-    return strip_think((await chat([{"role": "user", "content": prompt}])).content)
+    return strip_think((await chat([{"role": "user", "content": prompt}], temperature=0.0)).content)
+
+
+async def chat_stream(messages: list[dict], on_token, usage: dict | None = None, **kw):
+    """Стрим финального ответа: await on_token(text) на каждый чанк, возвращает полный текст."""
+    kw.setdefault("temperature", LLM_TEMPERATURE)
+    try:
+        r = await llm.chat.completions.create(model=LLM_MODEL, messages=messages, stream=True,
+                                              stream_options={"include_usage": True}, **kw)
+    except openai.BadRequestError:  # сервер не знает stream_options — стримим без usage
+        r = await llm.chat.completions.create(model=LLM_MODEL, messages=messages, stream=True, **kw)
+    out = []
+    async for chunk in r:
+        if (u := getattr(chunk, "usage", None)):
+            LLM_TOKENS.labels("prompt").inc(u.prompt_tokens)
+            LLM_TOKENS.labels("completion").inc(u.completion_tokens)
+            if usage is not None:
+                usage.update(prompt=u.prompt_tokens, completion=u.completion_tokens)
+        for ch in chunk.choices:
+            if text := ch.delta.content:
+                out.append(text)
+                await on_token(text)
+    return "".join(out)
 
 
 async def rerank(query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:

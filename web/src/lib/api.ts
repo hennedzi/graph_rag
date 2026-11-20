@@ -81,7 +81,11 @@ export type HarnessEvent =
       total_chars: number;
       ctx_tokens: number;
       edges: Edge[];
-    }
+      speculative?: boolean;
+  }
+  | { type: "fast_path_taken"; top_score: number }
+  | { type: "token"; text: string }
+  | { type: "answer_finished"; text: string; citations: Record<string, Citation> }
   | { type: "done"; result: HarnessResult }
   | { type: "error"; detail: string; session?: "lost" };
 export type Job = {

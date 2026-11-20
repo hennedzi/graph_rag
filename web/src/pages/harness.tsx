@@ -49,9 +49,10 @@ type State = {
   chars0: number; // контекст диалога до этого вопроса
   history?: boolean; // открыт из runs/: выводы инструментов там не хранятся
   stopping?: boolean; // остановка запрошена, сервер дорабатывает текущий вызов модели
+  stream?: string; // C5: финальный ответ, накопленный из token-событий
 };
 
-const initial: State = { query: "", running: false, budget: 32000, maxSteps: 8, chars: 0, ctx: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
+const initial: State = { query: "", running: false, budget: 64000, maxSteps: 8, chars: 0, ctx: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
 
 function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dialog: number } | { type: "abort" } | { type: "stopping" }): State {
   switch (e.type) {
@@ -64,6 +65,13 @@ function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dial
       return { ...s, budget: e.budget, maxSteps: e.max_steps, turn: e.turn, chars: e.chars, ctx: e.ctx_tokens, chars0: e.chars, edges: e.edges };
     case "thought":
       return { ...s, steps: [...s.steps, { kind: "thought", key: `t${s.steps.length}`, step: e.step, text: e.text }] };
+    case "fast_path_taken": // C4: реранкер уверен — ответ без графа и второго круга
+      return { ...s, steps: [...s.steps, { kind: "thought", key: `f${s.steps.length}`, step: s.steps.length + 1,
+                                          text: `быстрый путь: реранкер уверен (score ${(e.top_score ?? 0).toFixed(2)})` }] };
+    case "token": // C5: текст ответа печатается постепенно
+      return { ...s, stream: (s.stream ?? "") + e.text };
+    case "answer_finished": // финал: полный текст и цитаты (дальше придёт done с claims)
+      return { ...s, stream: e.text };
     case "call":
       return { ...s, steps: [...s.steps, { kind: "tool", key: `${e.step}:${e.id}:${s.steps.length}`, step: e.step, tool: e.tool, args: e.args }] };
     case "result": {
@@ -83,6 +91,8 @@ function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dial
       return { ...s, running: false, error: e.detail, finished: Date.now() };
     case "abort":
       return { ...s, running: false, error: s.result ? undefined : "Остановлено вручную", finished: Date.now() };
+    default: // неизвестный тип события не должен ронять страницу
+      return s;
   }
 }
 
@@ -153,41 +163,58 @@ const inlineArgs = (tool: string, args: Record<string, unknown>) =>
         .join(" ");
 
 // ─── Лента: строки шагов в духе Claude Code ─────────────────────
-function TraceLine({ s, active, onClick }: { s: ToolStepT; active: boolean; onClick: () => void }) {
+function TraceLine({ s, active }: { s: ToolStepT; active: boolean }) {
   const meta = toolMeta(s.tool);
   const status = s.res && s.res.status !== "ok" ? STATUS[s.res.status] ?? { label: s.res.status, tone: "warn" as const } : null;
   const lines = s.res?.out ? s.res.out.split("\n").filter(Boolean) : [];
   const first = s.tool === "answer" ? (s.res?.out === "принято" ? "принято" : lines[0]) : lines[0];
+  const [open, setOpen] = useState(false);
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn("w-full rounded-md px-2 py-1 text-left font-mono hover:bg-secondary/60", active && "bg-secondary ring-1 ring-primary/30")}
-      data-testid={`step-tool-${s.key}`}
-    >
-      <div className="flex items-baseline gap-2 text-[12.5px]">
-        {s.res ? (
-          <meta.icon className="h-3.5 w-3.5 shrink-0 translate-y-0.5" style={{ color: `hsl(${meta.color})` }} />
-        ) : (
-          <Loader2 className="h-3 w-3 shrink-0 translate-y-0.5 animate-spin text-primary" />
+    <div className="w-full">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className={cn("w-full rounded-md px-2 py-1 text-left font-mono hover:bg-secondary/60", active && "bg-secondary ring-1 ring-primary/30")}
+        data-testid={`step-tool-${s.key}`}
+        aria-expanded={open}
+      >
+        <div className="flex items-baseline gap-2 text-[12.5px]">
+          {s.res ? (
+            <meta.icon className="h-3.5 w-3.5 shrink-0 translate-y-0.5" style={{ color: `hsl(${meta.color})` }} />
+          ) : (
+            <Loader2 className="h-3 w-3 shrink-0 translate-y-0.5 animate-spin text-primary" />
+          )}
+          <span className="shrink-0 font-semibold" style={{ color: `hsl(${meta.color})` }}>
+            {meta.label}
+          </span>
+          <span className="min-w-0 truncate text-muted-foreground">{inlineArgs(s.tool, s.args)}</span>
+          <span className="ml-auto flex shrink-0 items-center gap-2 text-[10.5px] text-muted-foreground">
+            {status && <span className={cn("rounded border px-1 py-px font-sans font-medium", toneClass[status.tone])}>{status.label}</span>}
+            {s.res?.speculative && <span className="rounded border px-1 py-px font-sans font-medium">из кэша</span>}
+            {s.res && (s.res.ms ? `${fmtMs(s.res.ms)} · ` : "") + `${fmtNum(s.res.chars)} симв.`}
+          </span>
+        </div>
+        {(first || !s.res) && (
+          <div className="flex gap-2 pl-1 text-[11.5px] text-muted-foreground">
+            <span className="select-none">⎿</span>
+            <span className="min-w-0 truncate">{s.res ? first : "выполняется…"}</span>
+            {lines.length > 1 && <span className="shrink-0 opacity-70">+{lines.length - 1} стр.</span>}
+          </div>
         )}
-        <span className="shrink-0 font-semibold" style={{ color: `hsl(${meta.color})` }}>
-          {meta.label}
-        </span>
-        <span className="min-w-0 truncate text-muted-foreground">{inlineArgs(s.tool, s.args)}</span>
-        <span className="ml-auto flex shrink-0 items-center gap-2 text-[10.5px] text-muted-foreground">
-          {status && <span className={cn("rounded border px-1 py-px font-sans font-medium", toneClass[status.tone])}>{status.label}</span>}
-          {s.res && (s.res.ms ? `${fmtMs(s.res.ms)} · ` : "") + `${fmtNum(s.res.chars)} симв.`}
-        </span>
-      </div>
-      {(first || !s.res) && (
-        <div className="flex gap-2 pl-1 text-[11.5px] text-muted-foreground">
-          <span className="select-none">⎿</span>
-          <span className="min-w-0 truncate">{s.res ? first : "выполняется…"}</span>
-          {lines.length > 1 && <span className="shrink-0 opacity-70">+{lines.length - 1} стр.</span>}
+      </button>
+      {open && s.res && (
+        <div className="mt-1 space-y-2 p-2 rounded-md border bg-muted/40 text-[11px]">
+          <div className="flex gap-2">
+            <span className="font-semibold text-muted-foreground">Аргументы</span>
+            <pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[10px] text-muted-foreground">{JSON.stringify(s.args, null, 2)}</pre>
+          </div>
+          <div>
+            <span className="font-semibold text-muted-foreground block mb-1">Вывод</span>
+            <pre className="whitespace-pre-wrap break-words font-mono text-[10px]">{s.res.out}</pre>
+          </div>
         </div>
       )}
-    </button>
+    </div>
   );
 }
 
@@ -233,7 +260,7 @@ function Trace({ s, sel, onPick }: { s: State; sel?: string; onPick: (key: strin
       </button>
       {shown && (
         <div className="ml-[6px] mt-2 space-y-0.5 border-l pl-3">
-          {s.steps.map((st) => (st.kind === "thought" ? <ThoughtLine key={st.key} s={st} /> : <TraceLine key={st.key} s={st} active={st.key === sel} onClick={() => onPick(st.key)} />))}
+          {s.steps.map((st) => (st.kind === "thought" ? <ThoughtLine key={st.key} s={st} /> : <TraceLine key={st.key} s={st} active={st.key === sel} />))}
           {s.running && (
             <div className="flex items-center gap-2 px-2 py-1 font-mono text-[12px] text-muted-foreground">
               <span className="h-2 w-2 animate-pulse rounded-full bg-primary" /> агент думает…
@@ -267,7 +294,14 @@ const ROUTE_NOTE: Record<string, string> = {
 };
 
 function Answer({ s }: { s: State }) {
-  if (!s.result && !s.error) return null;
+  if (!s.result && !s.error && !s.stream) return null;
+  if (!s.result && !s.error && s.stream)  // C5: ответ печатается, карточка с цитатами придёт на done
+    return (
+      <div className="pt-0.5" data-testid="answer-stream">
+        <p className="whitespace-pre-wrap text-sm leading-relaxed">{s.stream}</p>
+        {s.running && <span className="mt-1 inline-block h-4 w-1.5 animate-pulse bg-primary align-middle" />}
+      </div>
+    );
   if (s.result?.route === "chat")
     return (
       <p className="pt-0.5 text-sm leading-relaxed" data-testid="text-chat-reply">
@@ -452,19 +486,19 @@ function runStatus(s: State) {
 function RunHeader({ cur, v }: { cur: State; v: ReturnType<typeof view> }) {
   const st = runStatus(cur);
   return (
-    <div className="shrink-0 space-y-3 border-b p-3" data-testid="run-header">
+    <div className="shrink-0 space-y-1.5 border-b p-2" data-testid="run-header">
       <div className="flex items-center gap-2">
-        <span className={cn("flex h-7 w-7 items-center justify-center rounded-full", st.c)} style={{ background: "color-mix(in srgb, currentColor 12%, transparent)" }}>
-          <st.icon className={cn("h-3.5 w-3.5", st.spin && "animate-spin")} />
+        <span className={cn("flex h-6 w-6 items-center justify-center rounded-full", st.c)} style={{ background: "color-mix(in srgb, currentColor 12%, transparent)" }}>
+          <st.icon className={cn("h-3 w-3", st.spin && "animate-spin")} />
         </span>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[13px] font-medium">{st.t}</p>
-          <p className="truncate text-[11px] text-muted-foreground">
+          <p className="truncate text-[12px] font-medium">{st.t}</p>
+          <p className="truncate text-[10.5px] text-muted-foreground">
             {cur.history ? "из истории запусков" : `вопрос ${cur.turn} диалога`} · {fmtMs(v.elapsed)}
           </p>
         </div>
       </div>
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-3 gap-1">
         <Meter icon={Footprints} label="Шаги" value={String(v.stepNo)} sub={`/ ${cur.maxSteps}`} pct={cur.maxSteps ? (v.stepNo / cur.maxSteps) * 100 : 0} tone="bg-[hsl(var(--chart-2))]" />
         <Meter icon={Gauge} label="Окно" value={fmtNum(cur.ctx)} sub={`/ ${fmtNum(cur.budget)}`} pct={v.pct} tone={pctTone(v.pct)} />
         <Meter icon={Network} label="Граф" value={String(cur.edges.length)} sub="связей" />
@@ -708,13 +742,6 @@ export default function HarnessPage() {
     dispatch({ type: "stopping" });
     postJson("/harness/stop", { session_id: c.session }).catch(() => abort.current?.abort());
   };
-  // Остановка на сервере: новых шагов не будет, придёт done с outcome=cancelled и накопленными материалами.
-  // Обрываем соединение, только если сервер запуска не знает (сессии ещё нет или 404).
-  const stop = () => {
-    if (!c.session) return abort.current?.abort();
-    dispatch({ type: "stopping" });
-    postJson("/harness/stop", { session_id: c.session }).catch(() => abort.current?.abort());
-  };
   const select = (i: number) => {
     dispatch({ type: "select", i });
     setPickKey(undefined);
@@ -745,6 +772,15 @@ export default function HarnessPage() {
       sidebar={<Sidebar c={c} onSelect={select} onNew={() => dispatch({ type: "new" })} onLoad={load} busy={running} />}
       inspector={<Inspector cur={cur} v={v} tab={tab} setTab={setTab} pick={(k) => setPickKey(k)} sel={sel} />}
     >
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {running
+          ? "Идёт поиск по базе знаний."
+          : cur?.error
+            ? `Ошибка: ${cur.error}`
+            : cur?.result
+              ? "Ответ готов."
+              : ""}
+      </div>
       <ChatPane
         scrollRef={scroll}
         composer={

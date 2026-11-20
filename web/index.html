@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Graph RAG — Harness Console</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <script>
+      // тема до первой отрисовки: без вспышки белого
+      document.documentElement.classList.toggle("dark", localStorage.getItem("theme") !== "light");
+    </script>
   </head>
   <body>
     <div id="root"></div>
