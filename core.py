@@ -129,7 +129,40 @@ embedder = AsyncOpenAI(base_url=cfg["embeddings"]["url"].rstrip("/"), api_key="n
 reranker = AsyncOpenAI(base_url=cfg["reranker"]["url"].rstrip("/"), api_key="not-needed", timeout=60)
 
 
+_CACHE: dict = {}
+def _ttl() -> int:
+    return int(cfg.get("core", "cache_ttl", fallback="300")) if cfg.has_section("core") else 300
+
+def _cache_get(key):
+    v = _CACHE.get(key)
+    if v is None: return None
+    ts, val = v
+    if time.time() - ts > _ttl():
+        del _CACHE[key]
+        return None
+    return val
+
+def _cache_set(key, val):
+    _CACHE[key] = (time.time(), val)
+
+def invalidate_cache(scope=None):
+    if scope is None:
+        _CACHE.clear()
+    else:
+        for k in [k for k in list(_CACHE) if isinstance(k, tuple) and k and k[-1]==scope]:
+            del _CACHE[k]
+
 async def embed(texts: list[str]) -> list[list[float]]:
+    key = ("embed", tuple(texts))
+    cached = _cache_get(key)
+    if cached is not None:
+        return [list(x) for x in cached]
+    out = []
+    for i in range(0, len(texts), EMB_BATCH):
+        r = await embedder.embeddings.create(input=texts[i:i + EMB_BATCH], model=EMB_MODEL)
+        out += [d.embedding for d in r.data]
+    _cache_set(key, [list(x) for x in out])
+    return out
     out = []
     for i in range(0, len(texts), EMB_BATCH):
         r = await embedder.embeddings.create(input=texts[i:i + EMB_BATCH], model=EMB_MODEL)
@@ -208,11 +241,17 @@ def counts() -> dict[str, int]:
 # shortcut: синхронный pymilvus блокирует event loop (мс на Lite), при сотнях RPS — AsyncMilvusClient.
 def hybrid(query: str, q_dense: list[float], kind: str, limit: int, where: str = "") -> list[dict]:
     """dense + BM25 → RRF по строкам одного типа; where — доп. фильтр Milvus (уже проверенный вызывающим)."""
+    key = ("hybrid", query.strip().lower(), kind, limit, where)
+    cached = _cache_get(key)
+    if cached is not None:
+        return [dict(x) for x in cached]
     expr = f'type == "{kind}"' + (f" and ({where})" if where else "")
     reqs = [AnnSearchRequest([q_dense], "dense", {"metric_type": "IP", "params": {"ef": 64}}, limit * 2, expr=expr),
             AnnSearchRequest([query], "sparse", {"metric_type": "BM25"}, limit * 2, expr=expr)]
     res = milvus.hybrid_search(COLLECTION, reqs, RRFRanker(k=RRF_K), limit=limit, output_fields=FIELDS)
-    return [h["entity"] | {"id": h["id"], "score": h["distance"]} for h in (res[0] if res else [])]
+    out = [h["entity"] | {"id": h["id"], "score": h["distance"]} for h in (res[0] if res else [])]
+    _cache_set(key, [dict(x) for x in out])
+    return out
 
 
 async def retrieve(query: str, timings: dict, top_n: int = TOP_PASSAGES, min_score: float | None = None):
