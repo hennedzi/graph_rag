@@ -43,10 +43,18 @@ Take the first option that fully works:
 
 Never cut: validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs, anything the user asked for.
 
-## Levels
+# AGENTS.md — как работать в этом репозитории
 
-| Level | Behavior |
-|-------|----------|
-| **lite** | Build what was asked. Name the smaller option in one line and let the user pick. |
-| **full** | The rules above. Default. |
-| **ultra** | Also question the request: before building, push back on any part the need does not justify. |
+GraphRAG harness: агент с гибридным поиском (Milvus: dense + BM25) и графом знаний,
+FastAPI-бэкенд и веб-интерфейс на React. Детали задач — в `FUTURE.md` и `docs/tasks/`.
+
+## Команды
+- Тесты ядра: `uv run pytest -q test_core.py`
+- Фронтенд: `cd web && npm install && npm run build`
+- Сервер: `uvicorn api:app --reload`
+
+## Правила
+- Одна задача из `FUTURE.md` = один коммит, формат `<ID>: описание` (например, `C1: sse events`).
+- Не коммить `runs/`, кэши, `.env`, `node_modules`.
+- Схема событий (`run_id`, `seq`, `type`) — только расширение, не переименование.
+- Изменения в `web/src` проверяй сборкой, бэкенд — тестами.
