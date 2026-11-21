@@ -1,7 +1,8 @@
+import { Fragment } from "react";
 import { ShieldAlert, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
-import type { Citation, Claim, Outcome, Unsupported } from "@/lib/api";
+import type { Citation, Outcome, Unsupported } from "@/lib/api";
 
 export const OUTCOME_TITLE: Record<Outcome, string> = {
   answered: "Ответ подтверждён источниками",
@@ -21,6 +22,7 @@ export function SourceBadge({ h, cite }: { h: string; cite?: Citation }) {
           type="button"
           data-testid={`badge-source-${h}`}
           aria-label={`Источник ${h}${cite?.doc ? `, документ ${cite.doc}` : ""}`}
+          className="inline-flex align-baseline"
         >
           <Badge variant="outline" className="cursor-help border-primary/40 font-mono text-[11px] text-primary">
             {h}
@@ -38,26 +40,49 @@ export function SourceBadge({ h, cite }: { h: string; cite?: Citation }) {
   );
 }
 
-export function Claims({ claims, answer, citations }: { claims: Claim[]; answer: string; citations: Record<string, Citation> }) {
-  if (!claims.length) return <p className="whitespace-pre-wrap text-sm leading-relaxed">{answer}</p>;
+// Инлайн-ссылка [P#] внутри текста → кликабельный бейдж с текстом пассажа.
+function withCitations(text: string, citations: Record<string, Citation>) {
+  return text.split(/(\[(?:P\d+)\])/g).map((part, i) => {
+    const m = part.match(/^\[(P\d+)\]$/);
+    return m ? <SourceBadge key={i} h={m[1]} cite={citations[m[1]]} /> : <Fragment key={i}>{part}</Fragment>;
+  });
+}
+
+// Ответ — связный текст абзацами с инлайн-ссылками [P#], а не нумерованный список тезисов.
+export function ProseAnswer({ text, citations }: { text: string; citations: Record<string, Citation> }) {
+  const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
   return (
-    <ol className="space-y-3">
-      {claims.map((c, i) => (
-        <li key={i} className="flex gap-3" data-testid={`claim-${i}`}>
-          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary/15 font-mono text-[11px] text-primary" aria-hidden="true">
-            {i + 1}
-          </span>
-          <div className="space-y-1.5">
-            <p className="text-sm leading-relaxed">{c.text}</p>
-            <div className="flex flex-wrap gap-1">
-              {c.sources.map((h) => (
-                <SourceBadge key={h} h={h} cite={citations[h]} />
-              ))}
+    <div className="space-y-3 text-[15px] leading-relaxed text-foreground" data-testid="answer-prose">
+      {paras.map((p, i) => (
+        <p key={i} className="whitespace-pre-wrap break-words">
+          {withCitations(p, citations)}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+// Список ссылок внизу ответа: на основе каких пассажей он построен.
+export function SourcesList({ citations }: { citations: Record<string, Citation> }) {
+  const items = Object.entries(citations);
+  if (!items.length) return null;
+  return (
+    <div className="space-y-2 border-t pt-3" data-testid="answer-sources">
+      <p className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+        Источники · {items.length}
+      </p>
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        {items.map(([h, c]) => (
+          <div key={h} className="flex min-w-0 gap-2 rounded-lg border bg-muted/30 p-2">
+            <SourceBadge h={h} cite={c} />
+            <div className="min-w-0 flex-1">
+              <p className="truncate font-mono text-[10.5px] text-muted-foreground">{c.doc || c.doc_id}</p>
+              <p className="line-clamp-2 text-[11px] leading-snug text-muted-foreground">{c.text}</p>
             </div>
           </div>
-        </li>
-      ))}
-    </ol>
+        ))}
+      </div>
+    </div>
   );
 }
 

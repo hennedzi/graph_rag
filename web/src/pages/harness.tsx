@@ -1,25 +1,17 @@
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { Brain, Check, ChevronDown, ChevronLeft, ChevronRight, Copy, Gauge, History, Loader2, MessagesSquare, Network, Plus, ShieldAlert, ShieldCheck, Sparkles, Footprints, XCircle } from "lucide-react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Brain, Check, ChevronDown, Copy, Loader2, Network, Plus, Sparkles } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { BotMsg, ChatPane, Composer, ComposerChip, UserMsg, useStickToBottom } from "@/components/chat";
-import { ListItem, SectionLabel, Workspace, useStatus } from "@/components/shell";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { GraphView } from "@/components/graph-view";
-import { Claims, OUTCOME_TITLE, SourceBadge, Verdict } from "@/components/answer-card";
+import { ProseAnswer, SourcesList, Verdict } from "@/components/answer-card";
 import { STATUS, toneClass, toolMeta } from "@/components/tools";
-import { fmtMs, fmtNum, getJson, postJson, streamHarness, type Edge, type HarnessEvent, type HarnessResult, type RunSummary } from "@/lib/api";
+import { fmtMs, fmtNum, postJson, streamHarness, type Edge, type HarnessEvent, type HarnessResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-export const EXAMPLES = [
-  "Кто был учителем Леонарда Эйлера?",
-  "Как связаны Иоганн Бернулли и Леонард Эйлер?",
-  "Какое правило открыл учитель Леонарда Эйлера?",
-  "Кто пригласил Эйлера в Петербург?",
-];
+export const EXAMPLES = [];
 
 type ToolStepT = {
   kind: "tool";
@@ -37,19 +29,19 @@ type State = {
   budget: number;
   maxSteps: number;
   chars: number;
-  ctx: number; // токены окна LLM (usage.prompt_tokens + оценка новых выводов)
+  ctx: number;
   steps: Step[];
   edges: Edge[];
   result?: HarnessResult;
   error?: string;
   started?: number;
   finished?: number;
-  dialog: number; // номер диалога в ленте: новый диалог = новая серверная сессия
+  dialog: number;
   turn: number;
-  chars0: number; // контекст диалога до этого вопроса
-  history?: boolean; // открыт из runs/: выводы инструментов там не хранятся
-  stopping?: boolean; // остановка запрошена, сервер дорабатывает текущий вызов модели
-  stream?: string; // C5: финальный ответ, накопленный из token-событий
+  chars0: number;
+  history?: boolean;
+  stopping?: boolean;
+  stream?: string;
 };
 
 const initial: State = { query: "", running: false, budget: 64000, maxSteps: 8, chars: 0, ctx: 0, steps: [], edges: [], dialog: 0, turn: 1, chars0: 0 };
@@ -61,16 +53,15 @@ function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dial
     case "reset":
       return { ...initial, query: e.query, dialog: e.dialog, running: true, started: Date.now() };
     case "start":
-      // в продолжении диалога сервер присылает уже накопленный контекст и подграф
       return { ...s, budget: e.budget, maxSteps: e.max_steps, turn: e.turn, chars: e.chars, ctx: e.ctx_tokens, chars0: e.chars, edges: e.edges };
     case "thought":
       return { ...s, steps: [...s.steps, { kind: "thought", key: `t${s.steps.length}`, step: e.step, text: e.text }] };
-    case "fast_path_taken": // C4: реранкер уверен — ответ без графа и второго круга
+    case "fast_path_taken":
       return { ...s, steps: [...s.steps, { kind: "thought", key: `f${s.steps.length}`, step: s.steps.length + 1,
                                           text: `быстрый путь: реранкер уверен (score ${(e.top_score ?? 0).toFixed(2)})` }] };
-    case "token": // C5: текст ответа печатается постепенно
+    case "token":
       return { ...s, stream: (s.stream ?? "") + e.text };
-    case "answer_finished": // финал: полный текст и цитаты (дальше придёт done с claims)
+    case "answer_finished":
       return { ...s, stream: e.text };
     case "call":
       return { ...s, steps: [...s.steps, { kind: "tool", key: `${e.step}:${e.id}:${s.steps.length}`, step: e.step, tool: e.tool, args: e.args }] };
@@ -91,14 +82,13 @@ function reduce(s: State, e: HarnessEvent | { type: "reset"; query: string; dial
       return { ...s, running: false, error: e.detail, finished: Date.now() };
     case "abort":
       return { ...s, running: false, error: s.result ? undefined : "Остановлено вручную", finished: Date.now() };
-    default: // неизвестный тип события не должен ронять страницу
+    default:
       return s;
   }
 }
 
 type RunDetail = HarnessResult & { total_ms?: number };
 
-// Запуск из runs/*.json → ход в ленте (только чтение): выводы инструментов не сохраняются, остальное есть.
 function fromRun(r: RunDetail, dialog: number): State {
   const steps: Step[] = (r.trace ?? []).map((t, i) => ({
     kind: "tool",
@@ -133,36 +123,16 @@ function useNow(active: boolean) {
   return now;
 }
 
-const pctTone = (p: number) => (p > 75 ? "bg-[hsl(var(--chart-5))]" : p > 50 ? "bg-[hsl(var(--chart-3))]" : "bg-primary");
-
-function Meter({ icon: Icon, label, value, sub, pct, tone }: { icon: typeof Gauge; label: string; value: string; sub?: string; pct?: number; tone?: string }) {
-  return (
-    <div className="space-y-1.5 rounded-lg border bg-card p-2.5 shadow-xs">
-      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-        <Icon className="h-3.5 w-3.5" /> {label}
-      </div>
-      <div className="flex flex-wrap items-baseline gap-x-1.5">
-        <span className="whitespace-nowrap font-mono text-base font-semibold tabular-nums">{value}</span>
-        {sub && <span className="whitespace-nowrap font-mono text-[11px] text-muted-foreground">{sub}</span>}
-      </div>
-      {pct != null && (
-        <div className="h-1 overflow-hidden rounded-full bg-muted">
-          <motion.div className={cn("h-full rounded-full", tone ?? "bg-primary")} animate={{ width: `${Math.min(pct, 100)}%` }} transition={{ duration: 0.4 }} />
-        </div>
-      )}
-    </div>
-  );
-}
-
 const argText = (v: unknown) => (typeof v === "string" ? `"${v}"` : JSON.stringify(v));
 const inlineArgs = (tool: string, args: Record<string, unknown>) =>
-  tool === "answer" && Array.isArray(args.claims)
-    ? `${args.claims.length} утвержд.${args.no_answer ? " · no_answer" : ""}`
-    : Object.entries(args)
-        .map(([k, v]) => `${k}=${argText(v)}`)
-        .join(" ");
+  tool === "answer" && typeof args.text === "string"
+    ? `ответ · ${(args.text as string).length} симв.${args.no_answer ? " · no_answer" : ""}`
+    : tool === "answer" && Array.isArray(args.claims)
+      ? `${args.claims.length} утвержд.${args.no_answer ? " · no_answer" : ""}`
+      : Object.entries(args)
+          .map(([k, v]) => `${k}=${argText(v)}`)
+          .join(" ");
 
-// ─── Лента: строки шагов в духе Claude Code ─────────────────────
 function TraceLine({ s, active }: { s: ToolStepT; active: boolean }) {
   const meta = toolMeta(s.tool);
   const status = s.res && s.res.status !== "ok" ? STATUS[s.res.status] ?? { label: s.res.status, tone: "warn" as const } : null;
@@ -218,17 +188,40 @@ function TraceLine({ s, active }: { s: ToolStepT; active: boolean }) {
   );
 }
 
-function ThoughtLine({ s }: { s: Extract<Step, { kind: "thought" }> }) {
+function Typewriter({ text, cps = 240, className }: { text: string; cps?: number; className?: string }) {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    setCount(0);
+    let raf = 0;
+    let last = performance.now();
+    let acc = 0;
+    const tick = (t: number) => {
+      acc += ((t - last) / 1000) * cps;
+      last = t;
+      const next = Math.min(text.length, Math.floor(acc));
+      setCount((c) => (next > c ? next : c));
+      if (next < text.length) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [text, cps]);
+  return <span className={className}>{text.slice(0, count)}</span>;
+}
+
+function ThoughtLine({ s, animate }: { s: Extract<Step, { kind: "thought" }>; animate?: boolean }) {
   const [open, setOpen] = useState(false);
   return (
-    <button type="button" onClick={() => setOpen(!open)} className="flex w-full gap-2 rounded-md px-2 py-1 text-left hover:bg-secondary/40" data-testid="step-thought">
+    <button type="button" onClick={() => setOpen(!open)} className="flex w-full items-start gap-2 text-left" data-testid="thought">
       <Brain className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      <span className={cn("text-[12.5px] leading-relaxed text-muted-foreground", !open && "line-clamp-2")}>{s.text}</span>
+      {animate && !open ? (
+        <Typewriter text={s.text} className="line-clamp-2 text-[12.5px] leading-relaxed text-muted-foreground" />
+      ) : (
+        <span className={cn("text-[12.5px] leading-relaxed text-muted-foreground", !open && "line-clamp-2")}>{s.text}</span>
+      )}
     </button>
   );
 }
 
-// «Ход работы» как Chain of Thought: пока агент работает — раскрыт, после ответа сворачивается в цепочку иконок.
 function Trace({ s, sel, onPick }: { s: State; sel?: string; onPick: (key: string) => void }) {
   const [open, setOpen] = useState<boolean>();
   const tools = s.steps.filter((x): x is ToolStepT => x.kind === "tool");
@@ -260,7 +253,7 @@ function Trace({ s, sel, onPick }: { s: State; sel?: string; onPick: (key: strin
       </button>
       {shown && (
         <div className="ml-[6px] mt-2 space-y-0.5 border-l pl-3">
-          {s.steps.map((st) => (st.kind === "thought" ? <ThoughtLine key={st.key} s={st} /> : <TraceLine key={st.key} s={st} active={st.key === sel} />))}
+          {s.steps.map((st) => (st.kind === "thought" ? <ThoughtLine key={st.key} s={st} animate={s.running} /> : <TraceLine key={st.key} s={st} active={st.key === sel} />))}
           {s.running && (
             <div className="flex items-center gap-2 px-2 py-1 font-mono text-[12px] text-muted-foreground">
               <span className="h-2 w-2 animate-pulse rounded-full bg-primary" /> агент думает…
@@ -295,7 +288,7 @@ const ROUTE_NOTE: Record<string, string> = {
 
 function Answer({ s }: { s: State }) {
   if (!s.result && !s.error && !s.stream) return null;
-  if (!s.result && !s.error && s.stream)  // C5: ответ печатается, карточка с цитатами придёт на done
+  if (!s.result && !s.error && s.stream)
     return (
       <div className="pt-0.5" data-testid="answer-stream">
         <p className="whitespace-pre-wrap text-sm leading-relaxed">{s.stream}</p>
@@ -316,8 +309,9 @@ function Answer({ s }: { s: State }) {
           {s.error && <p className="font-mono text-sm text-destructive">{s.error}</p>}
           {s.result && (
             <>
-              <Claims claims={s.result.claims} answer={s.result.answer} citations={s.result.citations} />
+              <ProseAnswer text={s.result.answer} citations={s.result.citations} />
               <Verdict unsupported={s.result.unsupported} outcome={s.result.outcome} note={s.result.outcome_note} />
+              <SourcesList citations={s.result.citations} />
               <div className="flex items-center gap-2 border-t pt-2.5">
               <p className="min-w-0 flex-1 font-mono text-[11px] text-muted-foreground">
                 {ROUTE_NOTE[s.result.route ?? ""] ? `${ROUTE_NOTE[s.result.route!]} · ` : `${s.result.steps} шагов · `}окно {fmtNum(s.result.context_tokens)} ток. · потрачено {fmtNum(s.result.tokens_spent)} ток.
@@ -334,329 +328,6 @@ function Answer({ s }: { s: State }) {
   );
 }
 
-// ─── Инспектор ──────────────────────────────────────────────────
-function view(s: State, now: number) {
-  const tools = s.steps.filter((x): x is ToolStepT => x.kind === "tool");
-  const focus = tools.flatMap((t) => {
-    const first = t.res?.out.split("\n")[0] ?? "";
-    if (t.tool === "neighbors" && first.startsWith("сущность:")) return [first.slice(10).trim()];
-    if (t.tool === "rank_by_ppr" && first.startsWith("seed:")) return first.slice(5).split(",").map((x) => x.trim());
-    const m = t.tool === "find_paths" && first.match(/^пути (.+) → (.+):$/);
-    return m ? [m[1], m[2]] : [];
-  });
-  // экономия контекста: сколько пассажей агент увидел превью vs сколько реально прочитал
-  const seen = new Set(tools.flatMap((t) => [...(t.res?.out ?? "").matchAll(/\[(P\d+)\]/g)].map((m) => m[1])));
-  const read = new Map<string, string>();
-  for (const t of tools)
-    if (t.tool === "read_passage" && t.res)
-      for (const block of t.res.out.split("\n\n")) {
-        const m = block.match(/^\[(P\d+)\] ([\s\S]+)$/);
-        if (m && !m[2].startsWith("уже прочитан") && !m[2].startsWith("неизвестный хэндл")) read.set(m[1], m[2]);
-      }
-  if (s.history) for (const t of tools) if (t.tool === "read_passage") for (const h of (t.args.ids as string[]) ?? []) if (!read.has(h.toUpperCase())) read.set(h.toUpperCase(), "");
-  return {
-    tools,
-    focus,
-    seen,
-    read,
-    stepNo: Math.max(0, ...s.steps.map((x) => x.step)),
-    elapsed: s.result?.timings_ms?.total ?? (s.started ? (s.finished ?? now) - s.started : 0),
-    pct: (s.ctx / s.budget) * 100,
-  };
-}
-
-function Breakdown({ t }: { t: Record<string, number> }) {
-  const tools = Object.entries(t).filter(([k]) => k.startsWith("tool_"));
-  const parts = [
-    { k: "LLM агента", v: t.harness_llm ?? 0, c: "hsl(var(--chart-2))" },
-    { k: "Инструменты", v: tools.reduce((a, [, v]) => a + v, 0), c: "hsl(var(--chart-1))" },
-    { k: "Верификация", v: t.harness_verify ?? 0, c: "hsl(var(--chart-3))" },
-  ];
-  const sum = parts.reduce((a, p) => a + p.v, 0) || 1;
-  return (
-    <div className="space-y-2">
-      <div className="flex h-2 overflow-hidden rounded-full bg-muted">
-        {parts.map((p) => (
-          <div key={p.k} style={{ width: `${(p.v / sum) * 100}%`, background: p.c }} />
-        ))}
-      </div>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-        {parts.map((p) => (
-          <span key={p.k} className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full" style={{ background: p.c }} />
-            {p.k} <span className="font-mono text-foreground">{fmtMs(p.v)}</span>
-          </span>
-        ))}
-      </div>
-      <div className="space-y-1 pt-1">
-        {tools
-          .sort((a, b) => b[1] - a[1])
-          .map(([k, v]) => (
-            <div key={k} className="flex justify-between font-mono text-[11px] text-muted-foreground">
-              <span>{k.slice(5)}</span>
-              <span className="text-foreground">{fmtMs(v)}</span>
-            </div>
-          ))}
-      </div>
-    </div>
-  );
-}
-
-function StepDetail({ s, steps, onPick }: { s?: ToolStepT; steps: ToolStepT[]; onPick: (k: string) => void }) {
-  if (!s) return <Empty icon={Footprints} title="Шагов ещё нет" text="Кликните по шагу в «Ходе работы» — здесь будут аргументы и полный вывод инструмента." />;
-  const meta = toolMeta(s.tool);
-  const i = steps.indexOf(s);
-  const status = s.res ? STATUS[s.res.status] ?? { label: s.res.status, tone: "warn" as const } : null;
-  return (
-    <div className="space-y-3 p-3" data-testid="step-detail">
-      <div className="flex items-center gap-2">
-        <meta.icon className="h-4 w-4" style={{ color: `hsl(${meta.color})` }} />
-        <span className="font-mono text-sm font-semibold" style={{ color: `hsl(${meta.color})` }}>
-          {meta.label}
-        </span>
-        {status && <span className={cn("rounded border px-1.5 py-px text-[11px]", toneClass[status.tone])}>{status.label}</span>}
-        <span className="ml-auto flex items-center gap-1">
-          <Button size="icon" variant="ghost" className="h-6 w-6" disabled={i <= 0} onClick={() => onPick(steps[i - 1].key)} aria-label="Предыдущий шаг">
-            <ChevronLeft className="h-3.5 w-3.5" />
-          </Button>
-          <span className="font-mono text-[11px] text-muted-foreground">
-            {i + 1}/{steps.length}
-          </span>
-          <Button size="icon" variant="ghost" className="h-6 w-6" disabled={i >= steps.length - 1} onClick={() => onPick(steps[i + 1].key)} aria-label="Следующий шаг">
-            <ChevronRight className="h-3.5 w-3.5" />
-          </Button>
-        </span>
-      </div>
-      <p className="text-xs text-muted-foreground">
-        шаг {s.step} · {meta.hint}
-        {s.res && ` · ${fmtMs(s.res.ms)} · ${fmtNum(s.res.chars)} симв.`}
-      </p>
-      <div>
-        <p className="mb-1 text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">Аргументы</p>
-        <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-2 font-mono text-[11.5px]">{JSON.stringify(s.args, null, 2)}</pre>
-      </div>
-      <div>
-        <p className="mb-1 text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">Вывод для агента</p>
-        <pre className="whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-2 font-mono text-[11.5px] leading-relaxed text-muted-foreground">
-          {s.res ? s.res.out || "(в истории запусков вывод не сохраняется)" : "выполняется…"}
-        </pre>
-      </div>
-    </div>
-  );
-}
-
-function Sources({ s, v }: { s: State; v: ReturnType<typeof view> }) {
-  const cited = new Set((s.result?.claims ?? []).flatMap((c) => c.sources));
-  const rows = [...v.read.entries()];
-  return (
-    <div className="space-y-3 p-3">
-      <p className="text-xs text-muted-foreground">
-        Увидел в превью <span className="font-mono text-foreground">{v.seen.size}</span>, прочитал целиком <span className="font-mono text-foreground">{v.read.size}</span> — полный текст только там, где он нужен для ответа.
-      </p>
-      {rows.map(([h, text]) => (
-        <div key={h} className={cn("space-y-1 rounded-lg border bg-card p-2.5 shadow-xs", cited.has(h) && "border-primary/40")} data-testid={`source-${h}`}>
-          <div className="flex items-center gap-2 font-mono text-[11px]">
-            <SourceBadge h={h} cite={s.result?.citations[h] ?? { doc_id: "", doc: "", text }} />
-            <span className="truncate text-muted-foreground">{s.result?.citations[h]?.doc}</span>
-            {cited.has(h) && <span className="ml-auto text-primary">в ответе</span>}
-          </div>
-          {(text || s.result?.citations[h]?.text) && <p className="line-clamp-4 text-xs leading-relaxed text-muted-foreground">{text || s.result?.citations[h]?.text}</p>}
-        </div>
-      ))}
-      {!rows.length && <Empty icon={Network} title="Пока ничего не прочитано" text="Агент открывает полный текст пассажа инструментом read_passage." />}
-    </div>
-  );
-}
-
-const TAB = "h-7 gap-1 rounded-md px-0 text-xs data-[state=active]:bg-background data-[state=active]:shadow-sm focus-visible:ring-1 focus-visible:ring-offset-0";
-const Count = ({ n }: { n?: number }) => (n ? <span className="font-mono text-[10.5px] text-muted-foreground">{n}</span> : null);
-
-function runStatus(s: State) {
-  if (s.stopping && s.running) return { icon: Loader2, t: "Останавливается: ждём текущий вызов модели", c: "text-muted-foreground", spin: true };
-  if (s.running) return { icon: Loader2, t: "Агент идёт по базе знаний", c: "text-primary", spin: true };
-  if (s.error) return { icon: XCircle, t: "Ошибка", c: "text-destructive" };
-  if (s.result?.route === "chat") return { icon: MessagesSquare, t: "Реплика без поиска", c: "text-muted-foreground" };
-  if (s.result?.unsupported.length) return { icon: ShieldAlert, t: "Есть неподтверждённое", c: "text-[hsl(var(--chart-5))]" };
-  const o = s.result?.outcome;
-  if (o === "answered") return { icon: ShieldCheck, t: OUTCOME_TITLE.answered, c: "text-primary" };
-  return { icon: ShieldAlert, t: o ? OUTCOME_TITLE[o] ?? o : "Статус проверки не сохранён", c: "text-[hsl(var(--chart-5))]" };
-}
-
-// Шапка инспектора: что сейчас происходит и три счётчика — видны на любой вкладке.
-function RunHeader({ cur, v }: { cur: State; v: ReturnType<typeof view> }) {
-  const st = runStatus(cur);
-  return (
-    <div className="shrink-0 space-y-1.5 border-b p-2" data-testid="run-header">
-      <div className="flex items-center gap-2">
-        <span className={cn("flex h-6 w-6 items-center justify-center rounded-full", st.c)} style={{ background: "color-mix(in srgb, currentColor 12%, transparent)" }}>
-          <st.icon className={cn("h-3 w-3", st.spin && "animate-spin")} />
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-[12px] font-medium">{st.t}</p>
-          <p className="truncate text-[10.5px] text-muted-foreground">
-            {cur.history ? "из истории запусков" : `вопрос ${cur.turn} диалога`} · {fmtMs(v.elapsed)}
-          </p>
-        </div>
-      </div>
-      <div className="grid grid-cols-3 gap-1">
-        <Meter icon={Footprints} label="Шаги" value={String(v.stepNo)} sub={`/ ${cur.maxSteps}`} pct={cur.maxSteps ? (v.stepNo / cur.maxSteps) * 100 : 0} tone="bg-[hsl(var(--chart-2))]" />
-        <Meter icon={Gauge} label="Окно" value={fmtNum(cur.ctx)} sub={`/ ${fmtNum(cur.budget)}`} pct={v.pct} tone={pctTone(v.pct)} />
-        <Meter icon={Network} label="Граф" value={String(cur.edges.length)} sub="связей" />
-      </div>
-    </div>
-  );
-}
-
-function Empty({ icon: Icon, title, text }: { icon: typeof Gauge; title: string; text: string }) {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-      <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/10">
-        <Icon className="h-5 w-5 text-primary" />
-      </span>
-      <p className="text-sm font-medium">{title}</p>
-      <p className="max-w-[260px] text-xs text-muted-foreground">{text}</p>
-    </div>
-  );
-}
-
-function Inspector({ cur, v, tab, setTab, pick, sel }: { cur?: State; v?: ReturnType<typeof view>; tab: string; setTab: (t: string) => void; pick: (k: string) => void; sel?: ToolStepT }) {
-  if (!cur || !v) return <Empty icon={Network} title="Инспектор запроса" text="Задайте вопрос — здесь появятся подграф, по которому шёл агент, каждый шаг и прочитанные источники." />;
-  return (
-    <div className="flex h-full flex-col">
-      <RunHeader cur={cur} v={v} />
-      <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col">
-        <TabsList className="mx-3 mt-3 grid h-8 shrink-0 grid-cols-4 rounded-lg bg-muted p-0.5">
-          <TabsTrigger value="graph" className={TAB} data-testid="tab-graph">
-            Граф <Count n={cur.edges.length} />
-          </TabsTrigger>
-          <TabsTrigger value="step" className={TAB} data-testid="tab-step">
-            Шаг <Count n={v.tools.length} />
-          </TabsTrigger>
-          <TabsTrigger value="sources" className={TAB} data-testid="tab-sources">
-            Источники <Count n={v.read.size} />
-          </TabsTrigger>
-          <TabsTrigger value="summary" className={TAB} data-testid="tab-summary">
-            Время
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="graph" className="mt-0 flex min-h-0 flex-1 flex-col gap-2 p-3 data-[state=inactive]:hidden">
-          {cur.edges.length ? (
-            <>
-              <div className="min-h-0 flex-1 overflow-hidden rounded-xl border bg-card">
-                <GraphView edges={cur.edges} focus={v.focus} />
-              </div>
-              {!!v.focus.length && (
-                <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
-                  в фокусе агента:
-                  {[...new Set(v.focus)].map((f) => (
-                    <span key={f} className="rounded-full border border-primary/30 bg-primary/10 px-2 py-px text-primary">
-                      {f}
-                    </span>
-                  ))}
-                </div>
-              )}
-            </>
-          ) : (
-            <Empty icon={Network} title="Связей пока нет" text={cur.running ? "Подграф вырастет, когда агент пойдёт по связям." : "Агент ответил без обхода связей: смотрите шаги и источники."} />
-          )}
-        </TabsContent>
-        <TabsContent value="step" className="mt-0 min-h-0 flex-1 overflow-y-auto data-[state=inactive]:hidden">
-          <StepDetail s={sel} steps={v.tools} onPick={pick} />
-        </TabsContent>
-        <TabsContent value="sources" className="mt-0 min-h-0 flex-1 overflow-y-auto data-[state=inactive]:hidden">
-          <Sources s={cur} v={v} />
-        </TabsContent>
-        <TabsContent value="summary" className="mt-0 min-h-0 flex-1 space-y-3 overflow-y-auto p-3 data-[state=inactive]:hidden">
-          {cur.result?.route === "chat" ? (
-            <Empty icon={MessagesSquare} title="Без LLM и поиска" text="Короткая реплика: ответ шаблоном, 0 токенов." />
-          ) : cur.result ? (
-            <div className="space-y-3 rounded-xl border bg-card p-3 shadow-xs">
-              <p className="text-[10.5px] font-semibold uppercase tracking-wider text-muted-foreground">Где потрачено время</p>
-              <Breakdown t={cur.result.timings_ms} />
-              <p className="border-t pt-2 font-mono text-[11px] text-muted-foreground">
-                потрачено {fmtNum(cur.result.tokens_spent)} ток. · инструменты вернули {fmtNum(cur.result.turn_chars ?? cur.result.context_chars)} симв.
-              </p>
-            </div>
-          ) : (
-            <Empty icon={Gauge} title="Ещё считаем" text="Разбивка по времени появится после ответа." />
-          )}
-        </TabsContent>
-      </Tabs>
-    </div>
-  );
-}
-
-// ─── Боковая панель: вопросы диалога и история запусков ─────────
-type Ev = HarnessEvent | { type: "reset"; query: string } | { type: "abort" } | { type: "stopping" };
-type Chat = { turns: State[]; sel: number; session?: string; dialog: number };
-
-// Каждое событие стрима относится к последнему ходу; reset открывает новый ход в текущем диалоге.
-function reduceChat(c: Chat, e: Ev | { type: "select"; i: number } | { type: "new" } | { type: "load"; run: RunDetail }): Chat {
-  if (e.type === "select") return { ...c, sel: e.i };
-  if (e.type === "new") return { ...c, session: undefined, dialog: c.dialog + 1 };
-  if (e.type === "load") return { turns: [...c.turns, fromRun(e.run, c.dialog + 1)], sel: c.turns.length, session: undefined, dialog: c.dialog + 2 };
-  if (e.type === "reset") return { ...c, turns: [...c.turns, reduce(initial, { ...e, dialog: c.dialog })], sel: c.turns.length };
-  if (!c.turns.length) return c;
-  const turns = [...c.turns];
-  turns[turns.length - 1] = reduce(turns[turns.length - 1], e);
-  const session = e.type === "start" ? e.session_id : e.type === "error" && e.session === "lost" ? undefined : c.session;
-  return { ...c, turns, session, dialog: e.type === "error" && e.session === "lost" ? c.dialog + 1 : c.dialog };
-}
-
-function TurnIcon({ t }: { t: State }) {
-  if (t.running) return <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />;
-  if (t.error) return <XCircle className="h-3.5 w-3.5 text-destructive" />;
-  if (t.result?.unsupported.length) return <ShieldAlert className="h-3.5 w-3.5 text-[hsl(var(--chart-5))]" />;
-  if (t.result?.outcome === "answered") return <ShieldCheck className="h-3.5 w-3.5 text-primary" />;
-  if (t.result?.outcome) return <ShieldAlert className="h-3.5 w-3.5 text-[hsl(var(--chart-5))]" />;
-  return <History className="h-3.5 w-3.5 text-muted-foreground" />;
-}
-
-function Sidebar({ c, onSelect, onNew, onLoad, busy }: { c: Chat; onSelect: (i: number) => void; onNew: () => void; onLoad: (id: string) => void; busy: boolean }) {
-  const runs = useQuery({ queryKey: ["runs"], queryFn: () => getJson<RunSummary[]>("/runs?limit=200") });
-  const hist = (runs.data ?? []).filter((r) => r.mode === "harness").reverse().slice(0, 30);
-  return (
-    <div className="pb-3">
-      <SectionLabel
-        action={
-          <Button size="sm" variant="ghost" className="h-6 gap-1 px-1.5 text-[11px] normal-case tracking-normal" onClick={onNew} disabled={busy || !c.session} data-testid="button-new-dialog">
-            <Plus className="h-3 w-3" /> новый
-          </Button>
-        }
-      >
-        Диалог
-      </SectionLabel>
-      {!c.turns.length && <p className="px-3 py-2 text-xs text-muted-foreground">Вопросы этой вкладки появятся здесь.</p>}
-      {c.turns.map((t, i) => (
-        <div key={i}>
-          {i > 0 && t.dialog !== c.turns[i - 1].dialog && <div className="mx-3 my-1 border-t border-dashed" />}
-          <ListItem
-            active={i === c.sel}
-            onClick={() => onSelect(i)}
-            icon={<TurnIcon t={t} />}
-            title={t.query}
-            meta={t.running ? "агент работает…" : `${t.steps.filter((x) => x.kind === "tool").length} вызовов · ${fmtNum(t.ctx)} ток.`}
-            testid={`turn-item-${i}`}
-          />
-        </div>
-      ))}
-      <SectionLabel>История</SectionLabel>
-      {!hist.length && <p className="px-3 py-2 text-xs text-muted-foreground">Запусков harness ещё нет.</p>}
-      {hist.map((r) => (
-        <ListItem
-          key={r.id}
-          onClick={() => onLoad(r.id)}
-          icon={r.unsupported ? <ShieldAlert className="h-3.5 w-3.5 text-[hsl(var(--chart-5))]" /> : <History className="h-3.5 w-3.5 text-muted-foreground" />}
-          title={r.query}
-          meta={`${new Date(r.timestamp).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })} · ${r.steps ?? "—"} шагов · ${fmtMs(r.total_ms)}`}
-          testid={`run-item-${r.id}`}
-        />
-      ))}
-    </div>
-  );
-}
-
-// Индикатор окна как Context из AI Elements: кольцо заполнения, подробности во всплывашке.
 function ContextRing({ s }: { s: State }) {
   const pct = Math.min((s.ctx / s.budget) * 100, 100);
   const r = 7, len = 2 * Math.PI * r;
@@ -684,59 +355,46 @@ function ContextRing({ s }: { s: State }) {
 
 const FEATURES = [
   { icon: Network, t: "Граф вместо простыни", d: "Связи сущностей, Personalized PageRank и цепочки путей — агент читает только нужные пассажи." },
-  { icon: Gauge, t: "Бюджет контекста", d: "Короткие ответы инструментов и превью вместо полных текстов экономят окно." },
+  { icon: Check, t: "Бюджет контекста", d: "Короткие ответы инструментов и превью вместо полных текстов экономят окно." },
   { icon: Sparkles, t: "Проверяемый ответ", d: "Утверждения с источниками [P#]; код и верификатор отклоняют неподтверждённое." },
 ];
 
+type Ev = HarnessEvent | { type: "reset"; query: string } | { type: "abort" } | { type: "stopping" };
+type Chat = { turns: State[]; sel: number; session?: string; dialog: number };
+
+function reduceChat(c: Chat, e: Ev | { type: "select"; i: number } | { type: "new" }): Chat {
+  if (e.type === "select") return { ...c, sel: e.i };
+  if (e.type === "new") return { ...c, session: undefined, dialog: c.dialog + 1 };
+  if (e.type === "reset") return { ...c, turns: [...c.turns, reduce(initial, { ...e, dialog: c.dialog })], sel: c.turns.length };
+  if (!c.turns.length) return c;
+  const turns = [...c.turns];
+  turns[turns.length - 1] = reduce(turns[turns.length - 1], e);
+  const session = e.type === "start" ? e.session_id : e.type === "error" && e.session === "lost" ? undefined : c.session;
+  return { ...c, turns, session, dialog: e.type === "error" && e.session === "lost" ? c.dialog + 1 : c.dialog };
+}
+
 export default function HarnessPage() {
   const [c, dispatch] = useReducer(reduceChat, { turns: [], sel: 0, dialog: 0 });
-  const [tab, setTab] = useState("graph");
-  const [pickKey, setPickKey] = useState<string>();
   const abort = useRef<AbortController | null>(null);
-  const qc = useQueryClient();
   const last = c.turns[c.turns.length - 1];
   const running = !!last?.running;
   const now = useNow(running);
   const cur = c.turns[c.sel];
-  const v = useMemo(() => (cur ? view(cur, now) : undefined), [cur, now]);
-  const scroll = useStickToBottom(`${c.turns.length}:${last?.steps.length}:${!!last?.result}`);
-  // выбранный шаг; пока не выбран — инспектор следует за последним шагом
-  const sel = v?.tools.find((t) => t.key === pickKey) ?? v?.tools[v.tools.length - 1];
-
-  useStatus(
-    cur && (
-      <>
-        {c.session && <span>сессия {c.session.slice(0, 6)}</span>}
-        <span>вопрос {cur.turn}</span>
-        <span className={cn((v?.pct ?? 0) > 75 && "text-[hsl(var(--chart-5))]")}>
-          окно {fmtNum(cur.ctx)}/{fmtNum(cur.budget)} ток.
-        </span>
-        <span>
-          шаг {v?.stepNo ?? 0}/{cur.maxSteps}
-        </span>
-        <span>{fmtMs(v?.elapsed ?? 0)}</span>
-      </>
-    ),
-    [c.session, cur?.turn, cur?.ctx, cur?.budget, v?.stepNo, cur?.maxSteps, Math.round((v?.elapsed ?? 0) / 500)],
-  );
+  const scroll = useStickToBottom(`${c.turns.length}:${last?.steps.length}:${Math.floor((last?.stream?.length ?? 0) / 80)}:${!!last?.result}`);
+  const tools = cur?.steps.filter((x): x is ToolStepT => x.kind === "tool") ?? [];
+  const sel = tools[tools.length - 1]?.key;
 
   const run = async (query: string) => {
     if (running) return;
     abort.current = new AbortController();
-    setPickKey(undefined);
     dispatch({ type: "reset", query });
     try {
       await streamHarness(query, dispatch, abort.current.signal, c.session);
     } catch (e) {
       if ((e as Error).name === "AbortError") dispatch({ type: "abort" });
       else dispatch({ type: "error", detail: (e as Error).message });
-    } finally {
-      qc.invalidateQueries({ queryKey: ["runs"] });
-      qc.invalidateQueries({ queryKey: ["dashboard"] });
     }
   };
-  // Остановка на сервере: новых шагов не будет, придёт done с outcome=cancelled и накопленными материалами.
-  // Обрываем соединение, только если сервер запуска не знает (сессии ещё нет или 404).
   const stop = () => {
     if (!c.session) return abort.current?.abort();
     dispatch({ type: "stopping" });
@@ -744,42 +402,16 @@ export default function HarnessPage() {
   };
   const select = (i: number) => {
     dispatch({ type: "select", i });
-    setPickKey(undefined);
     document.getElementById(`turn-${i}`)?.scrollIntoView({ block: "start", behavior: "smooth" });
   };
   const pick = (i: number, key: string) => {
     dispatch({ type: "select", i });
-    setPickKey(key);
-    setTab("step");
-  };
-  const load = async (id: string) => {
-    if (running) return;
-    const r = await getJson<RunDetail>(`/runs/${id}`);
-    setPickKey(undefined);
-    dispatch({ type: "load", run: r });
   };
 
   return (
-    <Workspace
-      id="harness"
-      title={
-        <span className="flex items-center gap-2">
-          Harness
-          {cur && <span className="font-normal normal-case tracking-normal text-muted-foreground/80">· {cur.query}</span>}
-        </span>
-      }
-      sidebarTitle="Сессия"
-      sidebar={<Sidebar c={c} onSelect={select} onNew={() => dispatch({ type: "new" })} onLoad={load} busy={running} />}
-      inspector={<Inspector cur={cur} v={v} tab={tab} setTab={setTab} pick={(k) => setPickKey(k)} sel={sel} />}
-    >
+    <div className="h-full overflow-y-auto">
       <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {running
-          ? "Идёт поиск по базе знаний."
-          : cur?.error
-            ? `Ошибка: ${cur.error}`
-            : cur?.result
-              ? "Ответ готов."
-              : ""}
+        {running ? "Идёт поиск по базе знаний." : cur?.error ? `Ошибка: ${cur.error}` : cur?.result ? "Ответ готов." : ""}
       </div>
       <ChatPane
         scrollRef={scroll}
@@ -835,13 +467,13 @@ export default function HarnessPage() {
               )}
               <UserMsg text={t.query} active={c.turns.length > 1 && i === c.sel} onClick={() => select(i)} />
               <BotMsg>
-                <Trace s={t} sel={i === c.sel ? sel?.key : undefined} onPick={(k) => pick(i, k)} />
+                <Trace s={t} sel={i === c.sel ? sel : undefined} onPick={() => pick(i, sel ?? "")} />
                 <Answer s={t} />
               </BotMsg>
             </div>
           ))
         )}
       </ChatPane>
-    </Workspace>
+    </div>
   );
 }

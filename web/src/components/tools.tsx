@@ -8,7 +8,7 @@ export const TOOLS: Record<string, { icon: LucideIcon; label: string; color: str
   query_db: { icon: Database, label: "query_db", color: "var(--chart-3)", hint: "фильтр-выражение Milvus" },
   search_passages: { icon: FileSearch, label: "search_passages", color: "var(--chart-1)", hint: "гибрид dense+BM25 + реранк" },
   read_passage: { icon: BookOpen, label: "read_passage", color: "var(--chart-5)", hint: "полный текст по P#" },
-  answer: { icon: CheckCheck, label: "answer", color: "var(--primary)", hint: "утверждения + источники" },
+  answer: { icon: CheckCheck, label: "answer", color: "var(--primary)", hint: "связный ответ + источники" },
 };
 
 export const toolMeta = (name: string) => TOOLS[name] ?? { icon: Wrench, label: name, color: "var(--muted-foreground)", hint: "" };

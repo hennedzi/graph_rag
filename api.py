@@ -17,6 +17,8 @@
 
 import asyncio
 import json
+import uuid
+import contextvars
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,6 +34,8 @@ import etl
 import graph
 import harness
 from core import timeit
+
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
 
 REQUESTS = Counter("rag_requests_total", "Запросы по итогу", ["endpoint", "outcome"])
 UNSUPPORTED = Counter("rag_unsupported_claims_total", "Неподтверждённые утверждения в /ask")
@@ -53,6 +57,7 @@ class Explore(BaseModel):
 class HarnessQuery(Query):
     session_id: str | None = Field(None, max_length=64, description="продолжить диалог: id из прошлого ответа")
     doc: str | None = Field(None, max_length=512, description="область поиска: один документ; не задано — все документы")
+    branch_from: int | None = Field(None, description="ветвить диалог с указанного seq")
 
 
 class StopQuery(BaseModel):
@@ -69,6 +74,15 @@ app = FastAPI(title="Graph RAG", lifespan=lifespan)
 app.mount("/metrics", make_asgi_app())
 # shortcut: Milvus Lite = один процесс, поэтому ETL здесь же; на Milvus standalone — отдельный uvicorn etl:app.
 app.mount("/etl", etl.app)
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    request_id_var.set(request_id)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 @app.exception_handler(openai.APIError)
@@ -134,7 +148,7 @@ async def ask(q: Query):
 @app.post("/harness")
 async def ask_harness(q: HarnessQuery):
     asyncio.create_task(core.prefetch(q.query))  # C3: поиск в фоне, пока модель думает
-    r = await harness.run(q.query, session_id=q.session_id, doc=q.doc)
+    r = await harness.run(q.query, session_id=q.session_id, doc=q.doc, branch_from=q.branch_from)
     REQUESTS.labels("harness", r.get("outcome") or "answered").inc()
     return r
 
@@ -156,7 +170,7 @@ async def harness_stream(q: HarnessQuery):
     async def work():
         asyncio.create_task(core.prefetch(q.query))
         try:
-            r = await harness.run(q.query, on_event=events.put, session_id=q.session_id, doc=q.doc)
+            r = await harness.run(q.query, on_event=events.put, session_id=q.session_id, doc=q.doc, branch_from=q.branch_from)
             REQUESTS.labels("harness", r.get("outcome") or "answered").inc()
             await events.put({"type": "done", "result": r})
         except harness.SessionError as e:

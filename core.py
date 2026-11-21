@@ -8,10 +8,8 @@
 id = хэш содержимого → повторная загрузка того же текста идемпотентна.
 """
 
-import configparser
 import hashlib
 import json
-import openai
 import logging
 import os
 import re
@@ -23,33 +21,33 @@ from pathlib import Path
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 os.environ.setdefault("GLOG_minloglevel", "2")
 
+import openai
 from openai import AsyncOpenAI
 from prometheus_client import Counter, Histogram
 from pymilvus import (AnnSearchRequest, DataType, Function, FunctionType,
                       MilvusClient, RRFRanker)
 
-# ─── Конфиг ────────────────────────────────────────────────────
-cfg = configparser.ConfigParser()
-if not cfg.read(os.environ.get("RAG_CONFIG", "config.ini"), encoding="utf-8"):
-    raise SystemExit("Нет config.ini: cp config.example.ini config.ini и впишите api_key")
+from config import CONFIG
 
-LLM_MODEL = cfg["llm"]["model"]
-LLM_TEMPERATURE = cfg.getfloat("llm", "temperature", fallback=0.0)
-EMB_MODEL, EMB_DIM = cfg["embeddings"]["model"], cfg.getint("embeddings", "dimension")
-EMB_BATCH = cfg.getint("embeddings", "batch", fallback=64)
-RERANK_MODEL = cfg["reranker"]["model"]
-COLLECTION = cfg["milvus"]["collection"]
+# ─── Константы из конфига ──────────────────────────────────────
+LLM_MODEL = CONFIG.llm.model
+LLM_TEMPERATURE = CONFIG.llm.temperature
+EMB_MODEL = CONFIG.embeddings.model
+EMB_DIM = CONFIG.embeddings.dimension
+EMB_BATCH = CONFIG.embeddings.batch
+RERANK_MODEL = CONFIG.reranker.model
+COLLECTION = CONFIG.milvus.collection
 
-TOP_ENTITIES      = cfg.getint("search", "top_entities")
-TOP_RELATIONS     = cfg.getint("search", "top_relations")
-PASSAGE_HITS      = cfg.getint("search", "passage_hits")
-RERANK_CANDIDATES = cfg.getint("search", "rerank_candidates")
-TOP_PASSAGES      = cfg.getint("search", "top_passages")
-MIN_RERANK_SCORE  = cfg.getfloat("search", "min_rerank_score")
-RRF_K             = cfg.getint("search", "rrf_k")
+TOP_ENTITIES = CONFIG.search.top_entities
+TOP_RELATIONS = CONFIG.search.top_relations
+PASSAGE_HITS = CONFIG.search.passage_hits
+RERANK_CANDIDATES = CONFIG.search.rerank_candidates
+TOP_PASSAGES = CONFIG.search.top_passages
+MIN_RERANK_SCORE = CONFIG.search.min_rerank_score
+RRF_K = CONFIG.search.rrf_k
 
-RUNS_DIR = Path(cfg.get("logging", "runs_dir", fallback="runs"))
-LOG_FILE = Path(cfg.get("logging", "file", fallback="logs/graph_rag.log"))
+RUNS_DIR = CONFIG.logging.runs_dir
+LOG_FILE = CONFIG.logging.file
 MAX_LINKS = 4096  # потолок Milvus для ARRAY; сущность в >4096 пассажах хранит первые 4096
 
 NO_CONTEXT = "В предоставленном контексте нет прямого ответа."
@@ -57,7 +55,7 @@ NO_CONTEXT = "В предоставленном контексте нет пря
 # ─── Логи ──────────────────────────────────────────────────────
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    level=cfg.get("logging", "level", fallback="INFO").upper(),
+    level=CONFIG.logging.level,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
 )
@@ -126,9 +124,9 @@ def dot(a, b) -> float:
 
 
 # ─── Клиенты моделей ───────────────────────────────────────────
-llm      = AsyncOpenAI(base_url=cfg["llm"]["url"].rstrip("/"), api_key=cfg["llm"]["api_key"], timeout=180)
-embedder = AsyncOpenAI(base_url=cfg["embeddings"]["url"].rstrip("/"), api_key="not-needed", timeout=60)
-reranker = AsyncOpenAI(base_url=cfg["reranker"]["url"].rstrip("/"), api_key="not-needed", timeout=60)
+llm = AsyncOpenAI(base_url=CONFIG.llm.url, api_key=CONFIG.llm.api_key, timeout=180)
+embedder = AsyncOpenAI(base_url=CONFIG.embeddings.url, api_key="not-needed", timeout=60)
+reranker = AsyncOpenAI(base_url=CONFIG.reranker.url, api_key="not-needed", timeout=60)
 
 
 _CACHE: dict = {}
@@ -146,19 +144,17 @@ async def prefetch(query: str):
 
 def prefetch_get(query: str):
     v = _PREFETCH.pop(query, None)
-    if v is None or time.time() - v[0] > _ttl():
+    if v is None or time.time() - v[0] > CONFIG.harness.cache_ttl:
         return None
     return v[1], v[2], v[3]
 
 
-def _ttl() -> int:
-    return int(cfg.get("core", "cache_ttl", fallback="300")) if cfg.has_section("core") else 300
-
 def _cache_get(key):
     v = _CACHE.get(key)
-    if v is None: return None
+    if v is None:
+        return None
     ts, val = v
-    if time.time() - ts > _ttl():
+    if time.time() - ts > CONFIG.harness.cache_ttl:
         del _CACHE[key]
         return None
     return val
@@ -252,7 +248,7 @@ async def rerank(query: str, documents: list[str], top_n: int) -> list[tuple[int
 
 
 # ─── Milvus ────────────────────────────────────────────────────
-milvus = MilvusClient(uri=cfg["milvus"]["uri"])
+milvus = MilvusClient(uri=CONFIG.milvus.uri)
 FIELDS = ["text", "type", "doc", "src", "dst", "passage_ids"]
 
 

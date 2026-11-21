@@ -25,15 +25,16 @@ from prometheus_client import Counter, Gauge, make_asgi_app
 
 import core
 import graph
-from core import cfg, log, normalize, timeit, uid
+from config import CONFIG
+from core import log, normalize, timeit, uid
 
-CHUNK_CHARS = cfg.getint("etl", "chunk_chars")
-MAX_BYTES = cfg.getint("etl", "max_upload_mb") * 1024 * 1024
+CHUNK_CHARS = CONFIG.etl.chunk_chars
+MAX_BYTES = CONFIG.etl.max_upload_mb * 1024 * 1024
 MAX_NAME = 200
 UPSERT_BATCH = 1000  # ~4 МБ на батч при dim=1024, далеко от лимита gRPC
 IN_BATCH = 500  # хэндлов в одном array_contains_any — фильтр остаётся коротким
 # Метаданные документов (дата, размер, порядок чанков): в схеме Milvus их нет, а пересоздавать коллекцию ради них дорого.
-REGISTRY = Path(cfg.get("etl", "registry", fallback="documents.json"))
+REGISTRY = CONFIG.etl.registry
 
 DOCS = Counter("etl_documents_total", "Документы по итогу обработки", ["status"])
 CHUNKS = Counter("etl_chunks_total", "Чанки, прошедшие через ETL")
@@ -111,7 +112,7 @@ def build_graph(pids: list[str], triples: list[list[tuple]]):
 
 
 # ─── Extract + Load ────────────────────────────────────────────
-_llm_slots = asyncio.Semaphore(cfg.getint("etl", "extract_concurrency"))
+_llm_slots = asyncio.Semaphore(CONFIG.etl.extract_concurrency)
 # shortcut: lock на процесс делает read-merge-write безопасным при одном воркере, для нескольких — очередь с одним писателем.
 _write_lock = asyncio.Lock()
 
