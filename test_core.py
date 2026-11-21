@@ -91,11 +91,11 @@ def test_read_passage_reports_skipped():
     import asyncio
     from harness import new_state, read_passage
     st = new_state()
-    for i in range(1, 8):
+    for i in range(1, 13):
         st["pid"][f"P{i}"] = f"p:{i}"
         st["text"][f"p:{i}"] = f"текст {i}"
-    out = asyncio.run(read_passage(st, ["P1", "p1", "[P2]", "P3", "P4", "P5", "P6", "P7"]))
-    assert "[P5] текст 5" in out and "текст 6" not in out and "не прочитаны (не больше 5 за вызов): P6 P7" in out
+    out = asyncio.run(read_passage(st, [f"P{i}" for i in range(1, 13)]))
+    assert "[P10] текст 10" in out and "текст 11" not in out and "не прочитаны (не больше 10 за вызов): P11 P12" in out
     assert "уже прочитан выше" in asyncio.run(read_passage(st, ["P1"]))
 
 
@@ -113,13 +113,43 @@ def test_render_answer():
     from harness import new_state, render
     st = new_state()
     st["pid"] |= {"P1": "p:1", "P2": "p:2"}
-    text, claims, errors = render(st, {"claims": [{"text": "**Эйлер** учился в Базеле", "sources": ["[P1]", "p2", "P1"]}]})
-    assert (text, errors) == ("Эйлер учился в Базеле [P1] [P2]", []) and claims[0]["sources"] == ["P1", "P2"]
-    assert render(st, {"claims": [{"text": "факт", "sources": []}]})[2] == ["нет sources: «факт»"]
-    assert "неизвестные хэндлы P9" in render(st, {"claims": [{"text": "факт", "sources": ["P9"]}]})[2][0]
-    assert render(st, {"claims": [], "no_answer": True})[0].startswith("В предоставленном контексте нет")
-    assert render(st, {"text": "старый формат [P1]"}) == ("старый формат [P1]", [], [])
-    assert render(st, {"claims": []})[2]
+    st["read"] |= {"P1", "P2"}
+
+    # Новый формат: текст БЕЗ [P#], источники в отдельном аргументе sources
+    text, claims, errors, sources = render(st, {"text": "Эйлер учился в Базеле.", "sources": ["P1", "P2"]})
+    assert (text, errors, sources) == ("Эйлер учился в Базеле.", [], ["P1", "P2"])
+    assert claims[0]["sources"] == ["P1", "P2"]
+
+    # Обратная совместимость: текст С [P#] тоже работает
+    text, claims, errors, sources = render(st, {"text": "**Эйлер** учился в Базеле [P1] [P2]."})
+    assert (text, errors, sources) == ("Эйлер учился в Базеле [P1] [P2].", [], ["P1", "P2"])
+    assert claims[0]["sources"] == ["P1", "P2"]
+
+    # кириллическая П в ссылках нормализуется к латинской P (модель путает алфавиты)
+    text, claims, errors, sources = render(st, {"text": "Эйлер учился у Бернулли [П1] [п2]."})
+    assert (text, errors, sources) == ("Эйлер учился у Бернулли [P1] [P2].", [], ["P1", "P2"])
+    assert claims[0]["sources"] == ["P1", "P2"]
+
+    # кириллическая П вне хэндлов не портится
+    text, claims, errors, sources = render(st, {"text": "Профессор читает лекцию [P1]."})
+    assert text == "Профессор читает лекцию [P1]." and errors == [] and sources == ["P1"]
+
+    # Ошибки: неизвестные хэндлы
+    assert "неизвестные хэндлы P9" in render(st, {"text": "факт [P9]"})[2][0]
+    # Ошибки: источники не прочитаны
+    st2 = new_state()
+    st2["pid"]["P1"] = "p:1"  # P1 известен, но не прочитан
+    assert "источники не прочитаны: P1" in render(st2, {"text": "факт [P1]"})[2][0]
+    # Текст без источников (и без [P#]) теперь допустим, если переданы sources
+    text, claims, errors, sources = render(st, {"text": "Эйлер учился в Базеле.", "sources": ["P1"]})
+    assert errors == [] and sources == ["P1"]
+    # Но если нет ни sources, ни [P#] — это ошибка только при верификации (claims пустые)
+    text, claims, errors, sources = render(st, {"text": "Эйлер учился в Базеле."})
+    assert sources == [] and claims == []  # claims пустые, верификатор не вызовется
+
+    assert render(st, {"no_answer": True})[0].startswith("В предоставленном контексте нет")
+    assert render(st, {"claims": [{"text": "факт", "sources": ["P1"]}]})[0] == "факт [P1]"  # старый формат → текст
+    assert render(st, {"text": "   "})[2] == ["пустой ответ: передай text"]
 
 
 def test_rel_line_records_edge():
@@ -142,7 +172,7 @@ def test_emit_without_listener_is_noop():
         got.append(ev)
     st["emit"] = put
     asyncio.run(emit(st, "call", tool="neighbors"))
-    assert got == [{"seq": 2, "type": "call", "tool": "neighbors", "duration_ms": 0}]  # живой UI и журнал получают одно и то же
+    assert got == [{"v": 1, "seq": 2, "type": "call", "tool": "neighbors", "duration_ms": 0}]  # живой UI и журнал получают одно и то же
 
 
 def test_run_summary(tmp_path):
@@ -316,9 +346,20 @@ def test_reply_guard():
     assert render(st, {"reply": "Иоганн Бернулли"})[2]  # вопрос к базе: reply без источников нельзя
     assert render(st, {"reply": "Иоганн Бернулли", "no_answer": True})[0].startswith("В предоставленном контексте нет")
     st = new_state("Я студент")
-    assert render(st, {"reply": "Хорошо, спрашивайте."}) == ("Хорошо, спрашивайте.", [], [])
-    assert render(st, {"reply": "Очень короткий ответ выходит", "no_answer": True}) == ("Очень короткий ответ выходит", [], [])
+    assert render(st, {"reply": "Хорошо, спрашивайте."}) == ("Хорошо, спрашивайте.", [], [], [])
+    assert render(st, {"reply": "Очень короткий ответ выходит", "no_answer": True}) == ("Очень короткий ответ выходит", [], [], [])
     assert render(st, {"reply": "Эйлер родился в Базеле [P1]"})[2]
+
+    # вопрос о самом ассистенте — это не вопрос к базе, reply разрешён
+    st = new_state("Что ты умеешь?")
+    assert render(st, {"reply": "Ищу по базе знаний и отвечаю со ссылками."}) == ("Ищу по базе знаний и отвечаю со ссылками.", [], [], [])
+
+    # reply с хэндлом [P#] — это факт: принимаем как текст и проверяем как обычно
+    st = new_state("README.md")
+    st["pid"]["P1"] = "p:1"
+    st["read"].add("P1")
+    text, claims, errors, sources = render(st, {"reply": "Кратко о проекте [P1]."})
+    assert claims and claims[0]["sources"] == ["P1"] and not errors and sources == ["P1"]
 
 
 def test_unlink():
@@ -421,6 +462,7 @@ def test_parallel_dispatch(monkeypatch):
 def test_prefetch_ttl(monkeypatch):
     """C3: префетч одноразовый и живёт ровно cache_ttl."""
     import asyncio
+    from config import CONFIG
 
     async def fake_retrieve(query, timings, top_n=10, min_score=None):
         return [], [], [{"id": "p1", "doc": "d", "text": "t", "score": 0.9}]
@@ -429,7 +471,7 @@ def test_prefetch_ttl(monkeypatch):
     asyncio.run(core.prefetch("q"))
     assert core.prefetch_get("q") is not None
     assert core.prefetch_get("q") is None  # второе чтение — промах
-    core._PREFETCH["q"] = (time.time() - core._ttl() - 1, [], [], [])
+    core._PREFETCH["q"] = (time.time() - CONFIG.harness.cache_ttl - 1, [], [], [])
     assert core.prefetch_get("q") is None  # TTL истёк
 
 
@@ -604,5 +646,13 @@ def test_plain_text_answer_is_parsed_and_verified(monkeypatch):
     ev = res["events"]
     assert sum(e["type"] == "token" for e in ev) >= 2  # C5: текст и в стриме
     assert "**" not in res["answer"] and "[" not in res["answer"].replace("[P", "")
-    assert "Иоганн Бернулли был учителем Леонарда Эйлера. [P1]" in res["answer"]
+    assert "Иоганн Бернулли был учителем Леонарда Эйлера [P1]" in res["answer"]
     assert len(res["claims"]) == 2
+
+
+def test_canonical_idempotent_basic():
+    from graph import canonical
+    names = {"якоб бернулли", "иоганн бернулли", "бернулли", "эйлер"}
+    res = canonical(names)
+    # идемпотентность: повторный прогон на результатах не меняет отображение
+    assert canonical(set(res.values())) == {}
